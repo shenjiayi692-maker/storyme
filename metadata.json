@@ -1,0 +1,7 @@
+{
+  "name": "StoryMe",
+  "description": "An interactive storytelling app for kids that adapts to their reading level, generates custom stories with bilingual subtitles, AI illustrations, and narration.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

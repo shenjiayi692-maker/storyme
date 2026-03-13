@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Stores user information and reading progress.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "name": { "type": "string", "description": "User's display name" },
+        "email": { "type": "string", "description": "User's email address" },
+        "readingLevel": { "type": "string", "description": "Determined reading level" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "name", "email"]
+    },
+    "Book": {
+      "title": "Book",
+      "description": "A generated or imported storybook.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Owner's UID" },
+        "title": { "type": "string" },
+        "pages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "english": { "type": "string" },
+              "chinese": { "type": "string" },
+              "imagePrompt": { "type": "string" },
+              "imageUrl": { "type": "string" },
+              "audioData": { "type": "string" }
+            }
+          }
+        },
+        "isImported": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "title", "pages"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserProfile",
+      "description": "User profile documents."
+    },
+    "/books/{bookId}": {
+      "schema": "Book",
+      "description": "Collection of storybooks."
+    }
+  }
+}
