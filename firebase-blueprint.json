@@ -5,48 +5,59 @@
       "description": "Stores user information and reading progress.",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "description": "Firebase Auth UID" },
-        "name": { "type": "string", "description": "User's display name" },
-        "email": { "type": "string", "description": "User's email address" },
-        "readingLevel": { "type": "string", "description": "Determined reading level" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "uid": { "type": "string", "description": "The unique user ID from Firebase Auth." },
+        "name": { "type": "string", "description": "The user's display name." },
+        "email": { "type": "string", "format": "email", "description": "The user's email address." },
+        "role": { "type": "string", "description": "The user's role (e.g., client, admin)." },
+        "readingLevel": { "type": "string", "description": "The user's determined reading level." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the profile was created." },
+        "dailyStamps": { "type": "number", "description": "Number of stories completed today." },
+        "currentStreak": { "type": "number", "description": "Current daily reading streak." },
+        "lastCompletedDate": { "type": "string", "description": "The date the last story was completed." },
+        "recentReads": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Array of story IDs recently opened by the user."
+        }
       },
       "required": ["uid", "name", "email"]
     },
-    "Book": {
-      "title": "Book",
-      "description": "A generated or imported storybook.",
+    "Story": {
+      "title": "Story",
+      "description": "Stores generated or imported stories.",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "description": "Owner's UID" },
-        "title": { "type": "string" },
+        "uid": { "type": "string", "description": "The ID of the user who owns the story." },
+        "title": { "type": "string", "description": "The title of the story." },
+        "subject": { "type": "string", "description": "The subject or theme of the story." },
         "pages": {
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
-              "english": { "type": "string" },
-              "chinese": { "type": "string" },
+              "text": { "type": "string" },
+              "translation": { "type": "string" },
               "imagePrompt": { "type": "string" },
               "imageUrl": { "type": "string" },
               "audioData": { "type": "string" }
             }
           }
         },
-        "isImported": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastOpenedAt": { "type": "string", "format": "date-time" },
+        "isImported": { "type": "boolean" }
       },
-      "required": ["uid", "title", "pages"]
+      "required": ["title", "pages"]
     }
   },
   "firestore": {
-    "/users/{uid}": {
+    "/users/{userId}": {
       "schema": "UserProfile",
-      "description": "User profile documents."
+      "description": "Collection of user profiles."
     },
-    "/books/{bookId}": {
-      "schema": "Book",
-      "description": "Collection of storybooks."
+    "/stories/{storyId}": {
+      "schema": "Story",
+      "description": "Collection of stories."
     }
   }
 }
