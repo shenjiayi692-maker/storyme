@@ -58,6 +58,17 @@
     "/stories/{storyId}": {
       "schema": "Story",
       "description": "Collection of stories."
+    },
+    "/stories/{storyId}/assets/{assetId}": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "uid": { "type": "string" },
+          "imageUrl": { "type": "string" },
+          "audioData": { "type": "string" }
+        }
+      },
+      "description": "Subcollection for large assets (images/audio) to avoid document size limits."
     }
   }
 }

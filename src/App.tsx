@@ -17,6 +17,7 @@ import {
   Send,
   Loader2,
   Trophy,
+  Award,
   Wand2,
   Image as ImageIcon,
   Home as HomeIcon,
@@ -45,7 +46,8 @@ import {
   processImportedStory,
   getWordDetails,
   generateStoryOptions,
-  Story,
+  generateAllStoryOptions,
+  Story, 
   WordSet,
   StoryOption
 } from './services/gemini';
@@ -54,6 +56,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { auth, db } from './firebase';
 import { Language, translations } from './translations';
+import { GLOBAL_STORY_OPTIONS } from './constants/storyOptions';
 import { 
   createUserWithEmailAndPassword, 
   signInWithEmailAndPassword, 
@@ -75,7 +78,8 @@ import {
   query, 
   where, 
   orderBy,
-  getDocFromServer
+  getDocFromServer,
+  getDocs
 } from 'firebase/firestore';
 
 function cn(...inputs: ClassValue[]) {
@@ -132,6 +136,20 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   }
   console.error('Firestore Error: ', JSON.stringify(errInfo));
   throw new Error(JSON.stringify(errInfo));
+}
+
+function cleanData(data: any): any {
+  if (data === undefined) return null;
+  if (data === null || typeof data !== 'object') return data;
+  if (Array.isArray(data)) return data.map(cleanData);
+  
+  const cleaned: any = {};
+  for (const key in data) {
+    if (data[key] !== undefined) {
+      cleaned[key] = cleanData(data[key]);
+    }
+  }
+  return cleaned;
 }
 
 interface ErrorBoundaryProps {
@@ -248,10 +266,30 @@ export default function App() {
     return (t[key] as string) || levelName;
   };
 
-  const translateSubject = (subject: string) => {
-    if (!subject) return t.general;
-    const key = subject.toLowerCase() as keyof typeof t;
-    return (t[key] as string) || subject;
+  const getLevelValue = (levelName: string) => {
+    const levels = ['Word Explorer', 'Sentence Builder', 'Page Turner', 'Chapter Chaser', 'Plot Detective'];
+    return levels.indexOf(levelName);
+  };
+
+  const categorizeBook = (subject: string) => {
+    const s = subject.toLowerCase();
+    if (s.includes('magic') || s.includes('adventure') || s.includes('quest') || s.includes('fantasy') || s.includes('space') || s.includes('hero')) {
+      return 'adventureAndMagic';
+    }
+    if (s.includes('animal') || s.includes('nature') || s.includes('forest') || s.includes('ocean') || s.includes('garden') || s.includes('pet')) {
+      return 'animalsAndNature';
+    }
+    if (s.includes('friend') || s.includes('value') || s.includes('kindness') || s.includes('sharing') || s.includes('family') || s.includes('love') || s.includes('honesty')) {
+      return 'friendshipAndValues';
+    }
+    if (s.includes('science') || s.includes('discover') || s.includes('learn') || s.includes('history') || s.includes('invention') || s.includes('explore')) {
+      return 'scienceAndDiscovery';
+    }
+    return 'adventureAndMagic'; // Default
+  };
+
+  const translateSubject = (subjectKey: string) => {
+    return (t[subjectKey as keyof typeof t] as string) || subjectKey;
   };
 
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -265,19 +303,35 @@ export default function App() {
   const [currentSetIndex, setCurrentSetIndex] = useState(0);
   const [currentWordIndex, setCurrentWordIndex] = useState(0);
   const [results, setResults] = useState<{set: string, correct: number, missed: number}[]>([]);
+  const [previousLevel, setPreviousLevel] = useState<string | null>(null);
+  const [levelImproved, setLevelImproved] = useState(false);
   
   const [level, setLevel] = useState('');
   
   const [storyConfig, setStoryConfig] = useState({
     characters: [] as string[],
     locations: [] as string[],
+    characterDetails: '',
+    locationDetails: '',
     activities: '',
     values: [] as string[],
     imageSize: '1K' as '1K' | '2K' | '4K',
     storyLang: currentLanguage
   });
+  const [customCharacterInput, setCustomCharacterInput] = useState('');
+  const [customLocationInput, setCustomLocationInput] = useState('');
   const [configStep, setConfigStep] = useState(1);
   const [configOptions, setConfigOptions] = useState<{
+    characters: StoryOption[],
+    locations: StoryOption[],
+    values: StoryOption[]
+  }>({
+    characters: [],
+    locations: [],
+    values: []
+  });
+
+  const [configOptionsPool, setConfigOptionsPool] = useState<{
     characters: StoryOption[],
     locations: StoryOption[],
     values: StoryOption[]
@@ -296,9 +350,11 @@ export default function App() {
 
   const [myBooks, setMyBooks] = useState<Story[]>([]);
   const [allBooks, setAllBooks] = useState<Story[]>([]);
+  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
 
   // Word list and progress states
-  const [myWordList, setMyWordList] = useState<{word: string, explanation: string, exampleSentence: string}[]>([]);
+  const [myWordList, setMyWordList] = useState<{word: string, explanation: string, exampleSentence: string, status: 'learning' | 'learned', addedAt: string}[]>([]);
+  const [wordListFilter, setWordListFilter] = useState<'learning' | 'learned' | 'all'>('learning');
   const [showWordList, setShowWordList] = useState(false);
   const [dailyStamps, setDailyStamps] = useState<number>(0);
   const [currentStreak, setCurrentStreak] = useState<number>(0);
@@ -329,12 +385,19 @@ export default function App() {
     setStoryConfig({
       characters: [],
       locations: [],
+      characterDetails: '',
+      locationDetails: '',
       activities: '',
       values: [],
       imageSize: '1K',
       storyLang: currentLanguage
     });
     setConfigOptions({
+      characters: [],
+      locations: [],
+      values: []
+    });
+    setConfigOptionsPool({
       characters: [],
       locations: [],
       values: []
@@ -482,15 +545,82 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (state === 'config') {
-      if (configStep === 1 && configOptions.characters.length === 0) {
-        refreshOptions('characters');
-        refreshOptions('locations');
-      } else if (configStep === 2 && configOptions.values.length === 0) {
-        refreshOptions('values');
-      }
+    if ((state === 'config' || state === 'welcome' || state === 're-test-ask') && configOptions.characters.length === 0) {
+      refreshAllOptions();
     }
-  }, [state, configStep]);
+  }, [state]);
+
+  const refreshAllOptions = async () => {
+    try {
+      const isEnglish = currentLanguage.toLowerCase() === 'english';
+      
+      const translateOptions = (options: any[]) => {
+        return options.map(opt => {
+          if (isEnglish) return { text: opt.text, emoji: opt.emoji };
+          const translation = opt.translations[currentLanguage] || opt.text;
+          return {
+            text: `${opt.text} (${translation})`,
+            emoji: opt.emoji
+          };
+        });
+      };
+
+      const allOptions = {
+        characters: translateOptions(GLOBAL_STORY_OPTIONS.characters),
+        locations: translateOptions(GLOBAL_STORY_OPTIONS.locations),
+        values: translateOptions(GLOBAL_STORY_OPTIONS.values)
+      };
+
+      setConfigOptionsPool(allOptions);
+      
+      // Pick initial 8 random ones from the 24
+      const getRandom8 = (arr: any[]) => {
+        const shuffled = [...arr].sort(() => 0.5 - Math.random());
+        return shuffled.slice(0, 8);
+      };
+
+      setConfigOptions({
+        characters: getRandom8(allOptions.characters),
+        locations: getRandom8(allOptions.locations),
+        values: getRandom8(allOptions.values)
+      });
+    } catch (error) {
+      console.error("Error refreshing all options:", error);
+    }
+  };
+
+  const compressImage = (base64: string, maxWidth = 640, quality = 0.5): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = base64;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth) {
+          height = (maxWidth / width) * height;
+          width = maxWidth;
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          // Use webp if possible, fallback to jpeg
+          try {
+            resolve(canvas.toDataURL('image/webp', quality));
+          } catch (e) {
+            resolve(canvas.toDataURL('image/jpeg', quality));
+          }
+        } else {
+          resolve(base64);
+        }
+      };
+      img.onerror = () => resolve(base64);
+    });
+  };
 
   const handleAuth = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -520,7 +650,7 @@ export default function App() {
         };
         
         try {
-          await setDoc(doc(db, path), profile);
+          await setDoc(doc(db, path), cleanData(profile));
         } catch (error) {
           handleFirestoreError(error, OperationType.WRITE, path);
         }
@@ -580,7 +710,7 @@ export default function App() {
           readingLevel: '',
           createdAt: new Date().toISOString()
         };
-        await setDoc(doc(db, path), profile);
+        await setDoc(doc(db, path), cleanData(profile));
       } else {
         profile = docSnap.data();
       }
@@ -606,12 +736,12 @@ export default function App() {
         const currentRecent = userProfile?.recentReads || [];
         const newRecent = [bookId, ...currentRecent.filter((id: string) => id !== bookId)].slice(0, 10);
         
-        await updateDoc(doc(db, userPath), { recentReads: newRecent });
+        await updateDoc(doc(db, userPath), cleanData({ recentReads: newRecent }));
         setUserProfile((prev: any) => ({ ...prev, recentReads: newRecent }));
 
         // Also update lastOpenedAt if owner
         if (isOwner) {
-          await updateDoc(doc(db, storyPath), { lastOpenedAt: new Date().toISOString() });
+          await updateDoc(doc(db, storyPath), cleanData({ lastOpenedAt: new Date().toISOString() }));
         }
       } catch (error) {
         console.error("Failed to update reading history:", error);
@@ -623,6 +753,46 @@ export default function App() {
     setStory(book);
     setCurrentPage(0);
     setState('reading-choice');
+    
+    // Fetch assets from subcollection if logged in
+    if (user && book.id) {
+      try {
+        const assetsRef = collection(db, `stories/${book.id}/assets`);
+        const snapshot = await getDocs(assetsRef);
+        const assets: Record<number, { imageUrl?: string; audioData?: string }> = {};
+        snapshot.forEach(doc => {
+          const id = doc.id;
+          // Handle both legacy (idx) and new (idx_type) formats
+          const parts = id.split('_');
+          const idx = parseInt(parts[0]);
+          if (isNaN(idx)) return;
+          
+          if (!assets[idx]) assets[idx] = {};
+          const data = doc.data();
+          
+          if (parts.length > 1) {
+            if (parts[1] === 'image') assets[idx].imageUrl = data.imageUrl;
+            else if (parts[1] === 'audio') assets[idx].audioData = data.audioData;
+          } else {
+            // Legacy format
+            if (data.imageUrl) assets[idx].imageUrl = data.imageUrl;
+            if (data.audioData) assets[idx].audioData = data.audioData;
+          }
+        });
+        
+        setStory(prev => {
+          if (!prev || prev.id !== book.id) return prev;
+          const newPages = prev.pages.map((page, idx) => ({
+            ...page,
+            ...assets[idx]
+          }));
+          return { ...prev, pages: newPages };
+        });
+      } catch (err) {
+        console.error("Failed to fetch story assets:", err);
+      }
+    }
+    
     generatePageAssets(0, book);
     
     if (book.id) {
@@ -633,6 +803,8 @@ export default function App() {
   const startTest = async () => {
     setState('loading');
     setLoadingMessage(t.preparingQuest);
+    setPreviousLevel(userProfile?.readingLevel || null);
+    setLevelImproved(false);
     try {
       const sets = await generateLevelWords(currentLanguage);
       setWordSets(sets);
@@ -659,10 +831,17 @@ export default function App() {
     const levels = ['Word Explorer', 'Sentence Builder', 'Page Turner', 'Chapter Chaser', 'Plot Detective'];
 
     if (newResults[currentSetIndex].missed >= 2) {
-      // User failed 2 words in the current level. Stop and assign this level.
-      const determinedLevel = levels[currentSetIndex];
+      // User failed 2 words in the current level.
+      // Logic: If fail Level 2 (index 1), give Level 1 (index 0).
+      // If fail Level 1 (index 0), give Level 1 (index 0).
+      const determinedLevel = levels[Math.max(0, currentSetIndex - 1)];
       setLevel(determinedLevel);
       saveLevel(determinedLevel);
+      
+      if (previousLevel && getLevelValue(determinedLevel) > getLevelValue(previousLevel)) {
+        setLevelImproved(true);
+      }
+      
       setState('test-result');
       return;
     }
@@ -677,16 +856,36 @@ export default function App() {
       const determinedLevel = levels[4]; // Plot Detective
       setLevel(determinedLevel);
       saveLevel(determinedLevel);
+      
+      if (previousLevel && getLevelValue(determinedLevel) > getLevelValue(previousLevel)) {
+        setLevelImproved(true);
+      }
+      
       setState('test-result');
     }
   };
 
   const refreshOptions = async (category: 'characters' | 'locations' | 'values') => {
-    try {
-      const newOptions = await generateStoryOptions(category, level || 'Word Explorer', currentLanguage);
-      setConfigOptions(prev => ({ ...prev, [category]: newOptions }));
-    } catch (error) {
-      console.error(`Error refreshing ${category} options:`, error);
+    if (configOptionsPool[category].length > 8) {
+      // Pick 8 random ones from the pool that are different from current if possible
+      const currentTexts = configOptions[category].map(o => o.text);
+      const available = configOptionsPool[category].filter(o => !currentTexts.includes(o.text));
+      
+      let newSet;
+      if (available.length >= 8) {
+        newSet = available.sort(() => 0.5 - Math.random()).slice(0, 8);
+      } else {
+        newSet = [...configOptionsPool[category]].sort(() => 0.5 - Math.random()).slice(0, 8);
+      }
+      
+      setConfigOptions(prev => ({ ...prev, [category]: newSet }));
+    } else {
+      try {
+        const newOptions = await generateStoryOptions(category, level || 'Word Explorer', currentLanguage);
+        setConfigOptions(prev => ({ ...prev, [category]: newOptions }));
+      } catch (error) {
+        console.error(`Error refreshing ${category} options:`, error);
+      }
     }
   };
 
@@ -694,7 +893,7 @@ export default function App() {
     if (user) {
       const path = `users/${user.uid}`;
       try {
-        await updateDoc(doc(db, path), { readingLevel: newLevel });
+        await updateDoc(doc(db, path), cleanData({ readingLevel: newLevel }));
         setUserProfile(prev => ({ ...prev, readingLevel: newLevel }));
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, path);
@@ -712,30 +911,20 @@ export default function App() {
         storyConfig.locations,
         storyConfig.activities,
         storyConfig.values,
-        currentLanguage
+        currentLanguage,
+        storyConfig.characterDetails,
+        storyConfig.locationDetails
       );
       
-      // Generate first page image immediately for cover
-      setLoadingMessage(t.paintingCover);
-      await new Promise(resolve => setTimeout(resolve, 1500)); // Small delay to avoid burst limits
-      try {
-        const firstPage = generatedStory.pages[0];
-        const coverUrl = await generateImage(firstPage.imagePrompt, storyConfig.imageSize);
-        if (coverUrl) {
-          generatedStory.pages[0].imageUrl = coverUrl;
-        }
-      } catch (err) {
-        console.error("Failed to generate cover image:", err);
-      }
-
-      const storyWithUid = { ...generatedStory, uid: user?.uid || null, createdAt: new Date().toISOString() };
+      const storyWithUid = { ...generatedStory, uid: user?.uid || null, level, createdAt: new Date().toISOString() };
       
       if (user) {
         const path = 'stories';
         try {
           const docRef = doc(collection(db, path));
           const storyWithId = { ...storyWithUid, id: docRef.id };
-          await setDoc(docRef, storyWithId);
+          
+          await setDoc(docRef, cleanData(storyWithId));
           setStory(storyWithId);
           setCurrentPage(0);
           setState('reading-choice');
@@ -781,14 +970,15 @@ export default function App() {
 
       const truncated = truncateText(text, 500);
       const importedStory = await processImportedStory(truncated, currentLanguage);
-      const storyWithUid = { ...importedStory, uid: user?.uid || null, isImported: true, createdAt: new Date().toISOString() };
+      const storyWithUid = { ...importedStory, uid: user?.uid || null, level, isImported: true, createdAt: new Date().toISOString() };
       
       if (user) {
         const path = 'stories';
         try {
           const docRef = doc(collection(db, path));
           const storyWithId = { ...storyWithUid, id: docRef.id };
-          await setDoc(docRef, storyWithId);
+          
+          await setDoc(docRef, cleanData(storyWithId));
           setStory(storyWithId);
           setCurrentPage(0);
           setState('reading-choice');
@@ -838,7 +1028,10 @@ export default function App() {
         if (needsImage) {
           try {
             const url = await generateImage(page.imagePrompt, storyConfig.imageSize);
-            if (url) page.imageUrl = url;
+            if (url) {
+              // Compress image to save space
+              page.imageUrl = await compressImage(url, 800, 0.6);
+            }
           } catch (err) {
             console.error(`Image generation failed for page ${idx}:`, err);
           }
@@ -855,16 +1048,43 @@ export default function App() {
 
         // Update state to reflect new assets
         setStory(prev => {
-          if (!prev || prev.title !== currentStory.title) return prev;
+          if (!prev || prev.id !== currentStory.id) return prev;
           const newPages = [...prev.pages];
           newPages[idx] = { ...page };
           const updatedStory = { ...prev, pages: newPages };
           
           // Persist changes
           if (user && updatedStory.id) {
+            // Save heavy assets to subcollection to avoid 1MB document limit
+            // We split image and audio into separate documents to double the available space
+            const imagePath = `stories/${updatedStory.id}/assets/${idx}_image`;
+            const audioPath = `stories/${updatedStory.id}/assets/${idx}_audio`;
+            
+            if (page.imageUrl) {
+              setDoc(doc(db, imagePath), cleanData({ uid: user.uid, imageUrl: page.imageUrl })).catch(err => {
+                console.error(`Error updating image asset for page ${idx}:`, err);
+              });
+            }
+            
+            if (page.audioData) {
+              setDoc(doc(db, audioPath), cleanData({ uid: user.uid, audioData: page.audioData })).catch(err => {
+                console.error(`Error updating audio asset for page ${idx}:`, err);
+              });
+            }
+
+            // Update main document but keep it small
+            // We only keep the cover image (page 0) in the main document for the Explore view
+            const pagesForMainDoc = newPages.map((p, i) => {
+              const { imageUrl, audioData, ...rest } = p;
+              if (i === 0 && imageUrl) {
+                return { ...rest, imageUrl };
+              }
+              return rest;
+            });
+
             const path = `stories/${updatedStory.id}`;
-            updateDoc(doc(db, path), { pages: newPages }).catch(err => {
-              console.error(`Error updating Firestore for page ${idx}:`, err);
+            updateDoc(doc(db, path), cleanData({ pages: pagesForMainDoc })).catch(err => {
+              console.error(`Error updating main story document for page ${idx}:`, err);
             });
           } else {
             // Update local storage for non-logged in users
@@ -898,24 +1118,27 @@ export default function App() {
     await generateForPage(index);
     setIsGeneratingPage(false);
 
-    // Pre-fetch all subsequent pages with a longer delay to avoid rate limits
+    // Pre-fetch all subsequent pages in parallel with a small stagger to avoid rate limits
     const loopId = ++prefetchLoopRef.current;
     const prefetch = async () => {
-      for (let i = index + 1; i < currentStory.pages.length; i++) {
-        // Stop if a new prefetch loop has started
-        if (loopId !== prefetchLoopRef.current) break;
-
+      const pagesToGenerate = [];
+      for (let i = 0; i < currentStory.pages.length; i++) {
+        if (i === index) continue; // Skip current page as it's already done
+        
         // Check if page already has assets or is being generated
         if ((currentStory.pages[i].imageUrl && currentStory.pages[i].audioData) || generatingPagesRef.current.has(i)) continue;
         
-        // Shorter delay between pages to respect rate limits but be more responsive
-        await new Promise(resolve => setTimeout(resolve, 2000)); 
-        
-        // Re-check loopId after delay
-        if (loopId !== prefetchLoopRef.current) break;
-        
-        await generateForPage(i);
+        pagesToGenerate.push(i);
       }
+
+      // Start generation for all needed pages in parallel with a small stagger
+      pagesToGenerate.forEach((i, staggerIdx) => {
+        setTimeout(async () => {
+          // Stop if a new prefetch loop has started
+          if (loopId !== prefetchLoopRef.current) return;
+          await generateForPage(i);
+        }, staggerIdx * 800); // 800ms stagger between starting each page to be safe with rate limits
+      });
     };
     prefetch();
   };
@@ -1073,7 +1296,9 @@ export default function App() {
     const newWord = {
       word: selectedWord,
       explanation: wordDetails.explanation,
-      exampleSentence: wordDetails.exampleSentence
+      exampleSentence: wordDetails.exampleSentence,
+      status: 'learning' as const,
+      addedAt: new Date().toISOString().split('T')[0]
     };
 
     if (!myWordList.some(w => w.word.toLowerCase() === selectedWord.toLowerCase())) {
@@ -1082,6 +1307,14 @@ export default function App() {
       localStorage.setItem('myWordList', JSON.stringify(updatedList));
     }
     setSelectedWord(null);
+  };
+
+  const markAsLearned = (word: string) => {
+    const updatedList = myWordList.map(w => 
+      w.word.toLowerCase() === word.toLowerCase() ? { ...w, status: 'learned' as const } : w
+    );
+    setMyWordList(updatedList);
+    localStorage.setItem('myWordList', JSON.stringify(updatedList));
   };
 
   const finishStory = async () => {
@@ -1117,11 +1350,11 @@ export default function App() {
     if (user) {
       const path = `users/${user.uid}`;
       try {
-        await updateDoc(doc(db, path), {
+        await updateDoc(doc(db, path), cleanData({
           dailyStamps: newStamps,
           currentStreak: newStreak,
           lastCompletedDate: today
-        });
+        }));
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, path);
       }
@@ -1672,7 +1905,7 @@ export default function App() {
                       </div>
                       <div className="p-6">
                         <h4 className="font-bold text-gray-900 mb-1 line-clamp-1">{book.title}</h4>
-                        <p className="text-sm text-gray-400">{book.isImported ? t.imported : translateLevel(level)}</p>
+                        <p className="text-sm text-gray-400">{book.isImported ? t.imported : translateLevel(book.level || level)}</p>
                       </div>
                     </motion.div>
                   ))}
@@ -1728,54 +1961,103 @@ export default function App() {
                 </div>
 
                 <div className="space-y-16">
-                  {Object.entries(
-                    allBooks.reduce((acc, book) => {
-                      const subject = book.subject || 'General';
-                      const translatedSubject = translateSubject(subject);
-                      if (!acc[translatedSubject]) acc[translatedSubject] = [];
-                      acc[translatedSubject].push(book);
+                  {(() => {
+                    // Group books by fixed categories
+                    const grouped = allBooks.reduce((acc, book) => {
+                      const categoryKey = categorizeBook(book.subject || 'General');
+                      if (!acc[categoryKey]) acc[categoryKey] = [];
+                      acc[categoryKey].push(book);
                       return acc;
-                    }, {} as Record<string, Story[]>)
-                  ).map(([subject, books]) => (
-                    <div key={subject} className="space-y-8">
-                      <div className="flex items-center gap-4">
-                        <div className="h-px bg-gray-200 flex-1" />
-                        <h3 className="text-2xl font-black text-indigo-900 uppercase tracking-widest px-4">{subject}</h3>
-                        <div className="h-px bg-gray-200 flex-1" />
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-8">
-                        {(books as Story[]).map((book, i) => (
-                          <motion.div 
-                            key={i}
-                            initial={{ opacity: 0, y: 20 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            transition={{ delay: i * 0.05 }}
-                            onClick={() => openBook(book)}
-                            className="bg-white rounded-[32px] shadow-sm border border-gray-100 overflow-hidden cursor-pointer hover:shadow-xl transition-all group"
-                          >
-                            <div className="aspect-[3/4] overflow-hidden bg-gray-50">
-                              {book.pages[0].imageUrl ? (
-                                <img 
-                                  src={book.pages[0].imageUrl} 
-                                  alt={book.title} 
-                                  className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
-                                  referrerPolicy="no-referrer"
-                                />
-                              ) : (
-                                <div className="w-full h-full flex items-center justify-center text-gray-200">
-                                  <ImageIcon className="w-12 h-12" />
+                    }, {} as Record<string, Story[]>);
+
+                    // Sort categories by book count and pick top 4
+                    const sortedCategories = (Object.entries(grouped) as [string, Story[]][])
+                      .sort((a, b) => b[1].length - a[1].length)
+                      .slice(0, 4);
+
+                    if (sortedCategories.length === 0) {
+                      return (
+                        <div className="py-32 text-center space-y-6">
+                          <div className="bg-white/50 w-24 h-24 rounded-full flex items-center justify-center mx-auto">
+                            <Library className="w-12 h-12 text-gray-300" />
+                          </div>
+                          <p className="text-gray-500 text-xl font-medium">{t.noStoriesYet}</p>
+                        </div>
+                      );
+                    }
+
+                    return sortedCategories.map(([categoryKey, books]) => {
+                      const isExpanded = expandedCategories.has(categoryKey);
+                      const displayedBooks = isExpanded ? books : books.slice(0, 3);
+
+                      return (
+                        <div key={categoryKey} className="space-y-8">
+                          <div className="flex items-center gap-4">
+                            <div className="h-px bg-gray-200 flex-1" />
+                            <h3 className="text-2xl font-black text-indigo-900 uppercase tracking-widest px-4">
+                              {translateSubject(categoryKey)}
+                            </h3>
+                            <div className="h-px bg-gray-200 flex-1" />
+                          </div>
+                          
+                          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-8">
+                            {displayedBooks.map((book, i) => (
+                              <motion.div 
+                                key={i}
+                                initial={{ opacity: 0, y: 20 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                transition={{ delay: i * 0.05 }}
+                                onClick={() => openBook(book)}
+                                className="bg-white rounded-[32px] shadow-sm border border-gray-100 overflow-hidden cursor-pointer hover:shadow-xl transition-all group"
+                              >
+                                <div className="aspect-[3/4] overflow-hidden bg-gray-50">
+                                  {book.pages[0].imageUrl ? (
+                                    <img 
+                                      src={book.pages[0].imageUrl} 
+                                      alt={book.title} 
+                                      className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+                                      referrerPolicy="no-referrer"
+                                    />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-gray-200">
+                                      <ImageIcon className="w-12 h-12" />
+                                    </div>
+                                  )}
                                 </div>
-                              )}
+                                <div className="p-6">
+                                  <h4 className="font-bold text-gray-900 mb-1 line-clamp-1">{book.title}</h4>
+                                  <div className="flex justify-between items-center">
+                                    <p className="text-sm text-gray-400">{t.by} {book.uid === user?.uid ? t.you : t.explorer}</p>
+                                    <p className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg">{translateLevel(book.level || 'Word Explorer')}</p>
+                                  </div>
+                                </div>
+                              </motion.div>
+                            ))}
+                          </div>
+
+                          {books.length > 3 && (
+                            <div className="flex justify-center mt-8">
+                              <button
+                                onClick={() => {
+                                  const newExpanded = new Set(expandedCategories);
+                                  if (isExpanded) {
+                                    newExpanded.delete(categoryKey);
+                                  } else {
+                                    newExpanded.add(categoryKey);
+                                  }
+                                  setExpandedCategories(newExpanded);
+                                }}
+                                className="flex items-center gap-2 px-6 py-3 bg-white border-2 border-indigo-100 text-indigo-600 font-bold rounded-2xl hover:bg-indigo-50 transition-colors"
+                              >
+                                {isExpanded ? t.back : t.viewAll}
+                                <ChevronDown className={clsx("w-5 h-5 transition-transform", isExpanded && "rotate-180")} />
+                              </button>
                             </div>
-                            <div className="p-6">
-                              <h4 className="font-bold text-gray-900 mb-1 line-clamp-1">{book.title}</h4>
-                              <p className="text-sm text-gray-400">{t.by} {book.uid === user?.uid ? t.you : t.explorer}</p>
-                            </div>
-                          </motion.div>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
+                          )}
+                        </div>
+                      );
+                    });
+                  })()}
                   {allBooks.length === 0 && (
                     <div className="py-32 text-center space-y-6">
                       <div className="bg-white/50 w-24 h-24 rounded-full flex items-center justify-center mx-auto">
@@ -1819,7 +2101,9 @@ export default function App() {
               ) : (
                 <>
                   <div className="flex items-center justify-between">
-                    <h2 className="text-4xl font-serif font-bold text-gray-900">{t.yourProgress}</h2>
+                    <h2 className="text-4xl font-serif font-bold text-gray-900">
+                      {showWordList ? t.myWordList : t.yourProgress}
+                    </h2>
                     {showWordList && (
                       <button 
                         onClick={() => setShowWordList(false)}
@@ -1903,6 +2187,45 @@ export default function App() {
                       </div>
                       <p className="text-gray-500 text-lg">{t.completeNewBook}</p>
                     </div>
+
+                    {/* Badges */}
+                    <div className="bg-white p-10 rounded-[40px] border border-gray-100 shadow-sm space-y-8">
+                      <div className="flex items-center gap-3">
+                        <Award className="w-8 h-8 text-indigo-600" />
+                        <h3 className="text-2xl font-bold text-gray-900">{t.badges}</h3>
+                      </div>
+                      <div className="grid gap-6">
+                        {[3, 5, 10].map(days => (
+                          <div 
+                            key={days}
+                            className={cn(
+                              "flex items-center gap-6 p-6 rounded-3xl border-2 transition-all",
+                              currentStreak >= days 
+                                ? "bg-indigo-50 border-indigo-200" 
+                                : "bg-gray-50 border-gray-100 opacity-60"
+                            )}
+                          >
+                            <div className={cn(
+                              "w-16 h-16 rounded-2xl flex items-center justify-center shadow-lg",
+                              currentStreak >= days ? "bg-indigo-600 text-white" : "bg-gray-200 text-gray-400"
+                            )}>
+                              <Trophy className="w-8 h-8" />
+                            </div>
+                            <div className="space-y-1">
+                              <h4 className="text-xl font-bold text-gray-900">
+                                {t.dayReaderBadge.replace('{days}', days.toString())}
+                              </h4>
+                              <p className="text-gray-500">
+                                {t.finishNewBookOnXDays.replace('{days}', days.toString())}
+                              </p>
+                              <p className="text-sm font-bold text-indigo-600">
+                                {t.currentStreakLabel.replace('{streak}', currentStreak.toString())}
+                              </p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   </motion.div>
                 ) : (
                   <motion.div 
@@ -1910,8 +2233,50 @@ export default function App() {
                     initial={{ opacity: 0, x: 20 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -20 }}
-                    className="space-y-6"
+                    className="space-y-8"
                   >
+                    {/* Summary Cards */}
+                    <div className="grid grid-cols-3 gap-6">
+                      <div className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-sm text-center space-y-1">
+                        <div className="text-5xl font-bold text-gray-900">{myWordList.length}</div>
+                        <div className="text-gray-400 font-medium">{t.totalWords}</div>
+                      </div>
+                      <div className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-sm text-center space-y-1">
+                        <div className="text-5xl font-bold text-orange-400">
+                          {myWordList.filter(w => (w.status || 'learning') === 'learning').length}
+                        </div>
+                        <div className="text-gray-400 font-medium">{t.stillLearning}</div>
+                      </div>
+                      <div className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-sm text-center space-y-1">
+                        <div className="text-5xl font-bold text-green-500">
+                          {myWordList.filter(w => w.status === 'learned').length}
+                        </div>
+                        <div className="text-gray-400 font-medium">{t.learned}</div>
+                      </div>
+                    </div>
+
+                    {/* Filter Tabs */}
+                    <div className="flex gap-4">
+                      {(['learning', 'learned', 'all'] as const).map(filter => (
+                        <button
+                          key={filter}
+                          onClick={() => setWordListFilter(filter)}
+                          className={cn(
+                            "px-8 py-3 rounded-2xl font-bold transition-all text-lg",
+                            wordListFilter === filter 
+                              ? "bg-[#2d3748] text-white shadow-lg" 
+                              : "bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
+                          )}
+                        >
+                          {t[filter]} ({
+                            filter === 'all' 
+                              ? myWordList.length 
+                              : myWordList.filter(w => (w.status || 'learning') === filter).length
+                          })
+                        </button>
+                      ))}
+                    </div>
+
                     {myWordList.length === 0 ? (
                       <div className="bg-white p-20 rounded-[40px] text-center space-y-4">
                         <div className="bg-indigo-50 w-20 h-20 rounded-full flex items-center justify-center mx-auto">
@@ -1921,26 +2286,45 @@ export default function App() {
                         <p className="text-gray-400">{t.readStoriesToCollect}</p>
                       </div>
                     ) : (
-                      <div className="grid gap-4">
-                        {myWordList.map((item, idx) => (
-                          <div key={idx} className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-sm space-y-4 hover:shadow-md transition-shadow">
+                      <div className="grid gap-6">
+                        {myWordList
+                          .filter(w => wordListFilter === 'all' || (w.status || 'learning') === wordListFilter)
+                          .map((item, idx) => (
+                          <div key={idx} className="bg-white p-10 rounded-[40px] border border-gray-100 shadow-sm space-y-4 hover:shadow-md transition-shadow relative group">
                             <div className="flex justify-between items-start">
-                              <div className="space-y-1">
-                                <h4 className="text-3xl font-black text-indigo-900">{item.word}</h4>
-                                <p className="text-xl font-bold text-gray-500">{item.explanation}</p>
+                              <h4 className="text-3xl font-bold text-gray-900 font-serif">{item.word}</h4>
+                              <div className="flex gap-2">
+                                {(item.status || 'learning') === 'learning' && (
+                                  <button 
+                                    onClick={() => markAsLearned(item.word)}
+                                    className="px-6 py-2 bg-white border border-gray-200 text-gray-600 rounded-2xl font-medium hover:border-indigo-600 hover:text-indigo-600 transition-all text-sm"
+                                  >
+                                    {t.learnedIt}
+                                  </button>
+                                )}
+                                <button 
+                                  onClick={() => {
+                                    const utterance = new SpeechSynthesisUtterance(item.word);
+                                    window.speechSynthesis.speak(utterance);
+                                  }}
+                                  className="p-2 text-gray-400 hover:text-indigo-600 transition-colors"
+                                >
+                                  <Volume2 className="w-5 h-5" />
+                                </button>
                               </div>
-                              <button 
-                                onClick={() => {
-                                  const utterance = new SpeechSynthesisUtterance(item.word);
-                                  window.speechSynthesis.speak(utterance);
-                                }}
-                                className="p-3 bg-indigo-50 text-indigo-600 rounded-2xl hover:bg-indigo-100 transition-colors"
-                              >
-                                <Volume2 className="w-6 h-6" />
-                              </button>
                             </div>
-                            <div className="bg-gray-50 p-6 rounded-2xl space-y-2">
-                              <p className="text-lg font-bold text-gray-700">"{item.exampleSentence}"</p>
+                            
+                            <div className="space-y-4">
+                              <p className="text-xl text-gray-500 leading-relaxed">
+                                {item.explanation}
+                              </p>
+                              <p className="text-xl italic text-gray-400">
+                                "{item.exampleSentence}"
+                              </p>
+                            </div>
+
+                            <div className="pt-2 text-sm text-gray-300 font-medium">
+                              {t.addedOn} {item.addedAt || new Date().toISOString().split('T')[0]}
                             </div>
                           </div>
                         ))}
@@ -2065,6 +2449,13 @@ export default function App() {
                 </div>
                 <h2 className="text-5xl font-black text-gray-900">{t.questComplete}</h2>
                 <p className="text-2xl text-gray-500">{t.brilliantExplorer}</p>
+                {levelImproved && (
+                  <div className="bg-green-50 border border-green-100 p-6 rounded-[32px] space-y-2 max-w-md mx-auto flex flex-col items-center">
+                    <Sparkles className="w-8 h-8 text-green-600 mb-2" />
+                    <p className="text-green-600 font-bold text-xl">{t.greatJob}</p>
+                    <p className="text-green-500">{t.youHaveProgressed}</p>
+                  </div>
+                )}
                 <div className="bg-indigo-600 text-white px-12 py-6 rounded-[32px] text-4xl font-black inline-block shadow-2xl shadow-indigo-200">
                   {translateLevel(level)}
                 </div>
@@ -2146,7 +2537,68 @@ export default function App() {
                             <span className="font-bold text-gray-900 block">{opt.text}</span>
                           </button>
                         ))}
+                        
+                        {/* Custom Character Option */}
+                        <div className={cn(
+                          "p-6 rounded-3xl border-2 transition-all text-left space-y-3 group",
+                          storyConfig.characters.some(c => !configOptionsPool.characters.some(g => g.text === c))
+                            ? "border-indigo-600 bg-indigo-50 shadow-lg shadow-indigo-100"
+                            : "border-gray-100 hover:border-indigo-200 hover:bg-gray-50"
+                        )}>
+                          <div className="flex items-center gap-2">
+                            <span className="text-4xl block group-hover:scale-110 transition-transform">✨</span>
+                            <span className="font-bold text-gray-900 block">{t.customCharacter}</span>
+                          </div>
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              value={customCharacterInput}
+                              onChange={(e) => setCustomCharacterInput(e.target.value)}
+                              placeholder={t.characterName}
+                              className="w-full px-3 py-2 rounded-xl bg-white border border-gray-200 text-sm focus:border-indigo-400 outline-none"
+                            />
+                            <button 
+                              onClick={() => {
+                                if (customCharacterInput.trim() && storyConfig.characters.length < 2) {
+                                  setStoryConfig({
+                                    ...storyConfig, 
+                                    characters: [...storyConfig.characters, customCharacterInput.trim()]
+                                  });
+                                  setCustomCharacterInput('');
+                                }
+                              }}
+                              disabled={!customCharacterInput.trim() || storyConfig.characters.length >= 2}
+                              className="bg-indigo-600 text-white p-2 rounded-xl disabled:opacity-50"
+                            >
+                              <Plus className="w-4 h-4" />
+                            </button>
+                          </div>
+                          {storyConfig.characters.filter(c => !configOptionsPool.characters.some(g => g.text === c)).map(c => (
+                            <div key={c} className="flex items-center justify-between bg-white px-3 py-1.5 rounded-lg border border-indigo-100 text-sm">
+                              <span className="font-medium text-indigo-600 truncate mr-2">{c}</span>
+                              <button 
+                                onClick={() => setStoryConfig({...storyConfig, characters: storyConfig.characters.filter(char => char !== c)})}
+                                className="text-gray-400 hover:text-rose-500"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
                       </div>
+                    </div>
+
+                    {/* Character Details */}
+                    <div className="space-y-4 bg-indigo-50/50 p-6 rounded-3xl border border-indigo-100">
+                      <label className="text-sm font-black text-indigo-900 uppercase tracking-wider flex items-center gap-2">
+                        <User className="w-4 h-4" /> {t.characterDetails}
+                      </label>
+                      <textarea 
+                        value={storyConfig.characterDetails}
+                        onChange={e => setStoryConfig({...storyConfig, characterDetails: e.target.value})}
+                        placeholder={t.characterDetailsPlaceholder}
+                        className="w-full px-4 py-3 rounded-2xl bg-white border border-indigo-100 text-sm focus:border-indigo-400 outline-none resize-none h-20 shadow-sm"
+                      />
                     </div>
 
                     <div className="space-y-6">
@@ -2179,7 +2631,68 @@ export default function App() {
                             <span className="font-bold text-gray-900 block">{opt.text}</span>
                           </button>
                         ))}
+
+                        {/* Custom Location Option */}
+                        <div className={cn(
+                          "p-6 rounded-3xl border-2 transition-all text-left space-y-3 group",
+                          storyConfig.locations.some(l => !configOptionsPool.locations.some(g => g.text === l))
+                            ? "border-indigo-600 bg-indigo-50 shadow-lg shadow-indigo-100"
+                            : "border-gray-100 hover:border-indigo-200 hover:bg-gray-50"
+                        )}>
+                          <div className="flex items-center gap-2">
+                            <span className="text-4xl block group-hover:scale-110 transition-transform">📍</span>
+                            <span className="font-bold text-gray-900 block">{t.customLocation}</span>
+                          </div>
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              value={customLocationInput}
+                              onChange={(e) => setCustomLocationInput(e.target.value)}
+                              placeholder={t.locationName}
+                              className="w-full px-3 py-2 rounded-xl bg-white border border-gray-200 text-sm focus:border-indigo-400 outline-none"
+                            />
+                            <button 
+                              onClick={() => {
+                                if (customLocationInput.trim() && storyConfig.locations.length < 2) {
+                                  setStoryConfig({
+                                    ...storyConfig, 
+                                    locations: [...storyConfig.locations, customLocationInput.trim()]
+                                  });
+                                  setCustomLocationInput('');
+                                }
+                              }}
+                              disabled={!customLocationInput.trim() || storyConfig.locations.length >= 2}
+                              className="bg-indigo-600 text-white p-2 rounded-xl disabled:opacity-50"
+                            >
+                              <Plus className="w-4 h-4" />
+                            </button>
+                          </div>
+                          {storyConfig.locations.filter(l => !configOptionsPool.locations.some(g => g.text === l)).map(l => (
+                            <div key={l} className="flex items-center justify-between bg-white px-3 py-1.5 rounded-lg border border-indigo-100 text-sm">
+                              <span className="font-medium text-indigo-600 truncate mr-2">{l}</span>
+                              <button 
+                                onClick={() => setStoryConfig({...storyConfig, locations: storyConfig.locations.filter(loc => loc !== l)})}
+                                className="text-gray-400 hover:text-rose-500"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
                       </div>
+                    </div>
+
+                    {/* Location Details */}
+                    <div className="space-y-4 bg-indigo-50/50 p-6 rounded-3xl border border-indigo-100">
+                      <label className="text-sm font-black text-indigo-900 uppercase tracking-wider flex items-center gap-2">
+                        <ImageIcon className="w-4 h-4" /> {t.locationDetails}
+                      </label>
+                      <textarea 
+                        value={storyConfig.locationDetails}
+                        onChange={e => setStoryConfig({...storyConfig, locationDetails: e.target.value})}
+                        placeholder={t.locationDetailsPlaceholder}
+                        className="w-full px-4 py-3 rounded-2xl bg-white border border-indigo-100 text-sm focus:border-indigo-400 outline-none resize-none h-20 shadow-sm"
+                      />
                     </div>
                   </div>
                 )}
