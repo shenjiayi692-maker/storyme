@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">StoryMe</title>
+  <desc id="desc">An open storybook grows into illustrated pages, narration, questions, and five supported languages.</desc>
+  <rect width="1200" height="420" rx="34" fill="#fff4dc"/>
+  <circle cx="1059" cy="70" r="145" fill="#dfd1ff"/><circle cx="1113" cy="376" r="122" fill="#ffd5b5"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+    <text x="64" y="75" fill="#8a5b45" font-size="18" font-weight="800" letter-spacing="3">PERSONALIZED READING COMPANION</text>
+    <text x="64" y="164" fill="#3f3153" font-size="84" font-weight="830">StoryMe</text>
+    <text x="64" y="218" fill="#6c5b79" font-size="25">A storybook that grows with its reader.</text>
+    <g transform="translate(64 277)" font-size="17" font-weight="750">
+      <rect width="92" height="40" rx="20" fill="#5e4a79"/><text x="46" y="26" text-anchor="middle" fill="#fff">read</text>
+      <rect x="104" width="106" height="40" rx="20" fill="#ef8d70"/><text x="157" y="26" text-anchor="middle" fill="#3f3153">listen</text>
+      <rect x="222" width="102" height="40" rx="20" fill="#f1c95d"/><text x="273" y="26" text-anchor="middle" fill="#3f3153">ask</text>
+      <rect x="336" width="130" height="40" rx="20" fill="#8bcbb8"/><text x="401" y="26" text-anchor="middle" fill="#3f3153">translate</text>
+    </g>
+    <text x="64" y="363" fill="#9a856f" font-size="17">English · Français · 中文 · 한국어 · Español</text>
+  </g>
+  <g transform="translate(679 48)">
+    <path d="M0 65 Q130 8 246 77 V319 Q129 259 0 311Z" fill="#faf7ef" stroke="#6f5b84" stroke-width="3"/>
+    <path d="M246 77 Q362 8 492 65 V311 Q363 259 246 319Z" fill="#fffdf8" stroke="#6f5b84" stroke-width="3"/>
+    <path d="M246 78 V318" stroke="#b9aac8" stroke-width="3"/>
+    <path d="M64 218 C99 139 153 154 181 211 C153 225 122 225 93 212Z" fill="#8bcbb8"/>
+    <circle cx="118" cy="146" r="30" fill="#ef8d70"/><path d="M101 122 L106 90 L128 118 L154 96 L145 132" fill="#f1c95d"/>
+    <path d="M311 222 C334 173 364 138 411 120 C434 169 421 224 378 248Z" fill="#dfd1ff"/>
+    <path d="M310 254 C344 221 385 218 428 246" fill="none" stroke="#8bcbb8" stroke-width="8" stroke-linecap="round"/>
+    <g fill="#b8adbe"><rect x="42" y="260" width="142" height="7" rx="3"/><rect x="42" y="280" width="112" height="7" rx="3"/><rect x="300" y="276" width="140" height="7" rx="3"/></g>
+    <circle cx="480" cy="50" r="21" fill="#ef8d70"/><path d="M474 44 V57 L486 50Z" fill="#fff"/>
+  </g>
+</svg>
