@@ -6,6 +6,8 @@
   <a href="https://ai.studio/apps/bc984f46-9a43-46eb-a557-900dd22901da"><strong>Open in Google AI Studio</strong></a>
 </p>
 
+<p align="center"><strong>English</strong> · <a href="./README.zh-CN.md">中文</a></p>
+
 StoryMe is an interactive reading companion for children. It estimates a reader's level, lets them choose characters, places, activities, and values, then generates a five-page story with illustrations, narration, translations, questions, and word help.
 
 ## A story made for this reader
