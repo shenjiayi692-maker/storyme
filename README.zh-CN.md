@@ -8,6 +8,14 @@
 
 <p align="center"><a href="./README.md">English</a> · <strong>中文</strong></p>
 
+给孩子找一本难度刚好、又正好是他感兴趣的书，基本靠运气。StoryMe 直接生成一本——配插图、有朗读，而且难度是先测过再匹配的。
+
+```bash
+git clone https://github.com/shenjiayi692-maker/storyme && cd storyme && cp .env.example .env.local && npm i && npm run dev
+```
+
+它会起来并告诉你要填哪个 key；生成功能需要 Gemini API key。
+
 StoryMe 是一个面向儿童的互动阅读伙伴。它先估计读者的阅读水平，让孩子挑选角色、地点、活动和价值观，然后生成一个五页的故事，配上插图、朗读、翻译、提问和生词帮助。
 
 ## 为这个读者定制的故事
