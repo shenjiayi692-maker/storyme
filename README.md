@@ -72,3 +72,7 @@ Gemini provides structured story text, page prompts, translations, questions, im
 StoryMe is a prototype, not a supervised literacy curriculum. Generated stories, translations, definitions, images, narration, and reading-level estimates can be wrong or inappropriate. A parent, teacher, or caregiver should review generated material before a child uses it.
 
 Firebase rules and quotas must be reviewed before a public deployment. Do not expose unrestricted generation or storage endpoints, and do not treat the current reading-level interaction as a clinical or educational assessment.
+
+## License
+
+MIT—see [LICENSE](./LICENSE).
