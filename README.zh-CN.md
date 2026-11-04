@@ -71,7 +71,7 @@ Gemini 负责结构化的故事文本、每页的配图提示、翻译、提问�
 
 StoryMe 是一个原型，不是一套有人监督的识字课程。生成的故事、翻译、释义、图像、朗读和阅读水平估计都可能出错或不合适。家长、老师或看护者应在孩子使用前先行审阅生成的材料。
 
-`GEMINI_API_KEY` 会被编译进前端代码，任何打开已部署页面的人都能看到它。如果不在 AI Studio 里运行，公开分享之前请把生成请求放到服务端代理后面（至少要按 HTTP 来源限制这个 key 并设置配额）。
+不用代理时，`GEMINI_API_KEY` 会被编译进前端代码，任何打开已部署页面的人都能看到它。在 AI Studio 以外公开部署时，请使用 [`proxy/`](./proxy/README.md) 里的 Cloudflare Worker 并设置 `GEMINI_PROXY_URL`，这样 key 只留在服务端。
 
 `firestore.rules` 和 `storage.rules` 不会因为推送到 GitHub 而生效，需要用 `firebase deploy --only firestore:rules,storage` 部署（或粘贴到 Firebase 控制台）。公开部署之前必须复核 Firebase 的规则和配额。不要暴露不受限制的生成或存储端点，也不要把当前的阅读水平交互当作临床或教育评估。
 

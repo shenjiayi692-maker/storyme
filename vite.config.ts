@@ -13,7 +13,9 @@ export default defineConfig(({ mode }) => {
       tailwindcss(),
     ],
     define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY ?? ''),
+      // When a proxy is configured, never compile the key into the bundle.
+      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_PROXY_URL ? '' : (env.GEMINI_API_KEY ?? '')),
+      'process.env.GEMINI_PROXY_URL': JSON.stringify(env.GEMINI_PROXY_URL ?? ''),
     },
     build: {
       rollupOptions: {

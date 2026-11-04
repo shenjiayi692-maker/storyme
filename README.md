@@ -71,7 +71,7 @@ Gemini provides structured story text, page prompts, translations, questions, im
 
 StoryMe is a prototype, not a supervised literacy curriculum. Generated stories, translations, definitions, images, narration, and reading-level estimates can be wrong or inappropriate. A parent, teacher, or caregiver should review generated material before a child uses it.
 
-`GEMINI_API_KEY` is compiled into the browser bundle, so anyone who opens a deployed build can read it. Outside AI Studio, put generation behind a server-side proxy (or at minimum restrict the key by HTTP referrer and set quotas) before sharing a public URL.
+Without a proxy, `GEMINI_API_KEY` is compiled into the browser bundle and anyone who opens a deployed build can read it. For any public deployment outside AI Studio, use the Cloudflare Worker in [`proxy/`](./proxy/README.md) and set `GEMINI_PROXY_URL`; the key then stays server-side.
 
 `firestore.rules` and `storage.rules` are not applied by pushing to GitHub; deploy them with `firebase deploy --only firestore:rules,storage` (or paste them into the Firebase console). Firebase rules and quotas must be reviewed before a public deployment. Do not expose unrestricted generation or storage endpoints, and do not treat the current reading-level interaction as a clinical or educational assessment.
 

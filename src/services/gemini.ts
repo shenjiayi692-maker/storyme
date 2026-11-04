@@ -1,6 +1,12 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// With GEMINI_PROXY_URL set, calls go through the StoryMe proxy (proxy/worker.js),
+// which adds the real key server-side; the placeholder key below is replaced there.
+// Without it (e.g. inside AI Studio), the injected GEMINI_API_KEY is used directly.
+const proxyUrl = process.env.GEMINI_PROXY_URL;
+const ai = proxyUrl
+  ? new GoogleGenAI({ apiKey: "proxied", httpOptions: { baseUrl: proxyUrl } })
+  : new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 export interface StoryPage {
   text: string;
