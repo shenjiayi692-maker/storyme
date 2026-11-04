@@ -1,0 +1,15 @@
+# Deploy from this folder: npx wrangler deploy
+# Set the key once:        npx wrangler secret put GEMINI_API_KEY
+name = "storyme-gemini-proxy"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+[vars]
+# Comma-separated origins allowed to call the proxy (add your deployed site's URL).
+ALLOWED_ORIGINS = "http://localhost:3000"
+
+# 60 Gemini calls per minute per IP (a story is ~12 calls: text + 5 images + 5 voices).
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }

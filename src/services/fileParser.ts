@@ -1,8 +1,9 @@
 import * as pdfjs from 'pdfjs-dist';
 import mammoth from 'mammoth';
+// Bundle the worker that matches the installed pdfjs-dist version (v5 ships it as .mjs).
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
-// Set worker path for pdfjs
-pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 export const parsePdf = async (file: File): Promise<string> => {
   const arrayBuffer = await file.arrayBuffer();
@@ -12,7 +13,7 @@ export const parsePdf = async (file: File): Promise<string> => {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const textContent = await page.getTextContent();
-    const pageText = textContent.items.map((item: any) => item.str).join(' ');
+    const pageText = textContent.items.map((item) => ('str' in item ? item.str : '')).join(' ');
     fullText += pageText + ' ';
   }
   

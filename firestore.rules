@@ -41,6 +41,11 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    // Email/password accounts must confirm their email before writing content.
+    function isVerified() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
@@ -50,10 +55,17 @@ service cloud.firestore {
     }
 
     function isAdmin() {
+      // Email-based admin access requires a verified email; otherwise anyone could
+      // sign up with that address (email/password) and gain admin rights.
       return isAuthenticated() &&
         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-          (request.auth.token.email == "shenjiayi692@gmail.com" && request.auth.token.email_verified == true) ||
-          (request.auth.token.email == "shenjiayi@gmail.com"));
+          (request.auth.token.email_verified == true &&
+            request.auth.token.email in ["shenjiayi692@gmail.com", "shenjiayi@gmail.com"]));
+    }
+
+    function isStoryOwner(storyId) {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/stories/$(storyId)).data.uid == request.auth.uid;
     }
 
     function uidUnchanged() {
@@ -84,7 +96,7 @@ service cloud.firestore {
       return data.keys().hasOnly(['uid', 'name', 'email', 'role', 'readingLevel', 'createdAt', 'dailyStamps', 'currentStreak', 'lastCompletedDate', 'recentReads']) &&
              data.uid is string && data.uid.size() > 0 &&
              data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
-             isValidEmail(data.email) &&
+             (data.email == '' || isValidEmail(data.email)) &&
              data.role in ['client', 'admin'] &&
              (!('readingLevel' in data) || (data.readingLevel is string && data.readingLevel.size() < 50)) &&
              (!('createdAt' in data) || isValidDateString(data.createdAt)) &&
@@ -113,7 +125,8 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isAuthenticated();
+      // Profiles hold a child's name and email: only the owner (or an admin) may read them.
+      allow read: if isOwner(userId) || isAdmin();
       allow create: if isOwner(userId) && hasRequiredFields(['uid', 'name', 'email', 'role']) && isValidUserProfile(request.resource.data) && request.resource.data.role == 'client';
       allow update: if (isOwner(userId) && isValidUserProfile(request.resource.data) && uidNotModified() && request.resource.data.role == resource.data.role) || isAdmin();
     }
@@ -121,14 +134,15 @@ service cloud.firestore {
     match /stories/{storyId} {
       allow list: if isAuthenticated();
       allow get: if isAuthenticated();
-      allow create: if (isAuthenticated() && request.resource.data.uid == request.auth.uid && hasRequiredFields(['uid', 'title', 'pages']) && isValidStory(request.resource.data)) || isAdmin();
-      allow update: if (isDocOwner() && isValidStory(request.resource.data) && uidNotModified()) || isAdmin();
+      allow create: if (isVerified() && request.resource.data.uid == request.auth.uid && hasRequiredFields(['uid', 'title', 'pages']) && isValidStory(request.resource.data)) || isAdmin();
+      allow update: if (isDocOwner() && isVerified() && isValidStory(request.resource.data) && uidNotModified()) || isAdmin();
       allow delete: if isDocOwner() || isAdmin();
 
       match /assets/{pageIndex} {
         allow read: if isAuthenticated();
-        allow create: if isAuthenticated() && request.resource.data.uid == request.auth.uid;
-        allow update: if (isAuthenticated() && resource.data.uid == request.auth.uid && (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid)) || isAdmin();
+        // Only the owner of the parent story may attach images/audio to it.
+        allow create: if isStoryOwner(storyId) && isVerified() && request.resource.data.uid == request.auth.uid;
+        allow update: if (isStoryOwner(storyId) && resource.data.uid == request.auth.uid && (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid)) || isAdmin();
         allow delete: if (isAuthenticated() && resource.data.uid == request.auth.uid) || isAdmin();
       }
     }

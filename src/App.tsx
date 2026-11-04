@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import React, { useState, useEffect, useRef, ReactNode } from 'react';
+import { motion, AnimatePresence, type Variants } from 'motion/react';
 import { 
   BookOpen, 
   Sparkles, 
@@ -25,7 +25,6 @@ import {
   BarChart3,
   LogOut,
   Plus,
-  Calendar,
   Zap,
   ChevronDown,
   Upload,
@@ -46,12 +45,14 @@ import {
   processImportedStory,
   getWordDetails,
   generateStoryOptions,
-  generateAllStoryOptions,
+  normalizeAnnotation,
   Story, 
+  StoryPage,
   WordSet,
   StoryOption
 } from './services/gemini';
-import { parsePdf, parseDocx, truncateText } from './services/fileParser';
+import { audioBlobFromBase64, isRemoteAudio } from './services/audio';
+import { uploadNarration } from './services/storageService';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { auth, db } from './firebase';
@@ -78,6 +79,7 @@ import {
   query, 
   where, 
   orderBy,
+  limit,
   getDocFromServer,
   getDocs
 } from 'firebase/firestore';
@@ -138,6 +140,65 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   throw new Error(JSON.stringify(errInfo));
 }
 
+const SPEECH_LANG: Record<string, string> = {
+  english: 'en-US',
+  french: 'fr-FR',
+  chinese: 'zh-CN',
+  korean: 'ko-KR',
+  spanish: 'es-ES',
+};
+
+function speakWithBrowser(word: string, language: string) {
+  if (!('speechSynthesis' in window)) return;
+  const utterance = new SpeechSynthesisUtterance(word);
+  utterance.lang = SPEECH_LANG[language.toLowerCase()] || 'en-US';
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+}
+
+// English words use a recorded dictionary pronunciation when one exists;
+// everything else (and any miss) uses the browser voice for the story's language.
+function speakWord(word: string, language: string) {
+  if (language.toLowerCase() !== 'english') {
+    speakWithBrowser(word, language);
+    return;
+  }
+  const audio = new Audio(`https://api.dictionaryapi.dev/media/pronunciations/en/${encodeURIComponent(word.toLowerCase())}-us.mp3`);
+  audio.play().catch(() => speakWithBrowser(word, language));
+}
+
+const EXPLORE_LIMIT = 100;
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
+// Firestore documents are capped at 1 MB; keep inline narration safely below that.
+const MAX_INLINE_AUDIO_CHARS = 900_000;
+
+// Save a page's narration for a signed-in owner: upload to Storage and keep the URL,
+// or fall back to storing the base64 inline when Storage is unavailable and it fits.
+async function saveNarrationAsset(uid: string, storyId: string, pageIndex: number, assetPath: string, audio: string) {
+  let stored = audio;
+  if (!isRemoteAudio(audio)) {
+    try {
+      stored = await uploadNarration(uid, storyId, pageIndex, audio);
+    } catch (err) {
+      console.warn(`Narration upload failed for page ${pageIndex}; trying inline storage.`, err);
+      if (audio.length > MAX_INLINE_AUDIO_CHARS) {
+        console.error(`Narration for page ${pageIndex} is too large to store inline; it will be regenerated next time.`);
+        return;
+      }
+    }
+  }
+  try {
+    await setDoc(doc(db, assetPath), cleanData({ uid, audioData: stored }));
+  } catch (err) {
+    console.error(`Error saving audio asset for page ${pageIndex}:`, err);
+  }
+}
+
+function isVerifiedUser(u: FirebaseUser): boolean {
+  const usesPassword = u.providerData.some(p => p.providerId === 'password');
+  return u.emailVerified || !usesPassword;
+}
+
 function cleanData(data: any): any {
   if (data === undefined) return null;
   if (data === null || typeof data !== 'object') return data;
@@ -161,11 +222,8 @@ interface ErrorBoundaryState {
   error: Error | null;
 }
 
-class ErrorBoundary extends React.Component<any, any> {
-  constructor(props: any) {
-    super(props);
-    (this as any).state = { hasError: false, error: null };
-  }
+export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, error: null };
 
   static getDerivedStateFromError(error: Error) {
     return { hasError: true, error };
@@ -176,19 +234,26 @@ class ErrorBoundary extends React.Component<any, any> {
   }
 
   render() {
-    const state = (this as any).state;
-    const props = (this as any).props;
+    const { state, props } = this;
 
     if (state.hasError) {
       // Fallback to English if translations are not available
-      const fallbackT = translations['English'];
+      // The boundary sits outside App's state, so read the saved UI language directly.
+      let savedLang: Language = 'English';
+      try {
+        const stored = localStorage.getItem('appLanguage') as Language | null;
+        if (stored && stored in translations) savedLang = stored;
+      } catch {
+        // storage unavailable: keep English
+      }
+      const fallbackT = translations[savedLang];
       let errorMessage = fallbackT.somethingWentWrong;
       try {
         const parsedError = JSON.parse(state.error?.message || "");
         if (parsedError.error) {
-          errorMessage = `Database Error: ${parsedError.error}`;
+          errorMessage = `${fallbackT.databaseError}: ${parsedError.error}`;
         }
-      } catch (e) {
+      } catch {
         errorMessage = state.error?.message || errorMessage;
       }
 
@@ -204,7 +269,7 @@ class ErrorBoundary extends React.Component<any, any> {
               onClick={() => window.location.reload()}
               className="w-full bg-indigo-600 text-white py-3 rounded-xl font-bold hover:bg-indigo-700 transition-colors"
             >
-              Reload App
+              {fallbackT.reloadApp}
             </button>
           </div>
         </div>
@@ -216,10 +281,49 @@ class ErrorBoundary extends React.Component<any, any> {
 }
 // --- End Error Handling ---
 
+// Remove the heavy per-page assets (base64 image / narration audio), keeping only
+// the cover image on page 0. Used for the main Firestore story document and for
+// guest books in localStorage, both of which have tight size limits.
+function stripPageAssets(pages: StoryPage[]): StoryPage[] {
+  return pages.map((p, i) => {
+    const rest: StoryPage = { ...p };
+    delete rest.audioData;
+    if (i !== 0) delete rest.imageUrl;
+    return rest;
+  });
+}
+
+// Guest books live in localStorage (~5 MB per origin). Persist only the text and
+// cover; missing images/narration are regenerated when the book is opened. Never
+// let a quota error escape, since it would otherwise take down the whole app.
+function saveBooksLocally(key: 'myBooks' | 'allBooks', books: Story[]) {
+  try {
+    localStorage.setItem(key, JSON.stringify(books.map(b => ({ ...b, pages: stripPageAssets(b.pages) }))));
+  } catch (err) {
+    console.warn(`Could not save ${key} to localStorage:`, err);
+  }
+}
+
+function newLocalId(): string {
+  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function loadBooksLocally(key: 'myBooks' | 'allBooks'): Story[] {
+  try {
+    const raw = localStorage.getItem(key);
+    const books: Story[] = raw ? JSON.parse(raw) : [];
+    // Books saved before local ids existed: derive a stable id from createdAt so
+    // the same book gets the same id in both lists.
+    return books.map(b => (b.id ? b : { ...b, id: `local-${b.createdAt}` }));
+  } catch {
+    return [];
+  }
+}
+
 type AppState = 'home' | 'my-books' | 'explore' | 'progress' | 'welcome' | 'testing' | 'test-result' | 'config' | 'reading' | 'loading' | 'import' | 'auth' | 'reading-choice' | 're-test-ask';
 type AuthMode = 'login' | 'signup' | 'verify';
 
-const pageVariants = {
+const pageVariants: Variants = {
   initial: (direction: number) => ({
     x: direction > 0 ? '100%' : '-100%',
     rotateY: direction > 0 ? 45 : -45,
@@ -316,7 +420,6 @@ export default function App() {
     activities: '',
     values: [] as string[],
     imageSize: '1K' as '1K' | '2K' | '4K',
-    storyLang: currentLanguage
   });
   const [customCharacterInput, setCustomCharacterInput] = useState('');
   const [customLocationInput, setCustomLocationInput] = useState('');
@@ -349,6 +452,13 @@ export default function App() {
   const [loadingMessage, setLoadingMessage] = useState('');
 
   const [myBooks, setMyBooks] = useState<Story[]>([]);
+  const [localRecentReads, setLocalRecentReads] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('recentReads') || '[]');
+    } catch {
+      return [];
+    }
+  });
   const [allBooks, setAllBooks] = useState<Story[]>([]);
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
 
@@ -372,6 +482,26 @@ export default function App() {
   const [direction, setDirection] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  const loadProfile = async (uid: string) => {
+    const path = `users/${uid}`;
+    try {
+      const docSnap = await getDoc(doc(db, path));
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setUserProfile(data);
+        setLevel(data.readingLevel || '');
+      }
+    } catch (error) {
+      // Thrown errors inside async callbacks never reach the ErrorBoundary; just log.
+      console.error('Failed to load profile', path, error);
+    }
+  };
+
+  // Signed in: books with my uid. Guest: books created on this device (no uid).
+  const isMyBook = (book: Story) => (user ? book.uid === user.uid : !book.uid);
+
+  const recentReads: string[] = user ? (userProfile?.recentReads || []) : localRecentReads;
+
   const stopAudio = () => {
     if (audioRef.current) {
       audioRef.current.pause();
@@ -389,8 +519,7 @@ export default function App() {
       locationDetails: '',
       activities: '',
       values: [],
-      imageSize: '1K',
-      storyLang: currentLanguage
+      imageSize: '1K'
     });
     setConfigOptions({
       characters: [],
@@ -413,21 +542,13 @@ export default function App() {
 
   // Auth Listener
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      // An email/password account that hasn't verified its email stays signed in to
+      // Firebase (so the "I've verified" button can re-check) but is a guest in the app.
+      const u = firebaseUser && isVerifiedUser(firebaseUser) ? firebaseUser : null;
       setUser(u);
       if (u) {
-        const path = `users/${u.uid}`;
-        try {
-          const docRef = doc(db, path);
-          const docSnap = await getDoc(docRef);
-          if (docSnap.exists()) {
-            const data = docSnap.data();
-            setUserProfile(data);
-            setLevel(data.readingLevel || '');
-          }
-        } catch (error) {
-          handleFirestoreError(error, OperationType.GET, path);
-        }
+        await loadProfile(u.uid);
       } else {
         setUserProfile(null);
         setLevel('');
@@ -471,11 +592,8 @@ export default function App() {
     setLastCompletedDate(storedLastDate);
 
     // Load local books
-    const storedMyBooks = localStorage.getItem('myBooks');
-    if (storedMyBooks) setMyBooks(JSON.parse(storedMyBooks));
-    
-    const storedAllBooks = localStorage.getItem('allBooks');
-    if (storedAllBooks) setAllBooks(JSON.parse(storedAllBooks));
+    setMyBooks(loadBooksLocally('myBooks'));
+    setAllBooks(loadBooksLocally('allBooks'));
 
     return () => unsubscribe();
   }, []);
@@ -500,8 +618,11 @@ export default function App() {
     });
 
     // Sync Global Books (Explore)
+    // Explore shows the newest shared stories; don't stream the whole collection.
     const globalQuery = query(
-      collection(db, path)
+      collection(db, path),
+      orderBy('createdAt', 'desc'),
+      limit(EXPLORE_LIMIT)
     );
 
     const unsubscribeGlobal = onSnapshot(globalQuery, (snapshot) => {
@@ -548,6 +669,8 @@ export default function App() {
     if ((state === 'config' || state === 'welcome' || state === 're-test-ask') && configOptions.characters.length === 0) {
       refreshAllOptions();
     }
+    // Only re-run when the screen changes; refreshAllOptions is recreated every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
   const refreshAllOptions = async () => {
@@ -611,7 +734,7 @@ export default function App() {
           // Use webp if possible, fallback to jpeg
           try {
             resolve(canvas.toDataURL('image/webp', quality));
-          } catch (e) {
+          } catch {
             resolve(canvas.toDataURL('image/jpeg', quality));
           }
         } else {
@@ -655,15 +778,14 @@ export default function App() {
           handleFirestoreError(error, OperationType.WRITE, path);
         }
         
-        setUser(u);
-        setUserProfile(profile);
+        // Not verified yet: stay a guest until the email link is clicked.
         setAuthMode('verify');
       } else {
         const userCredential = await signInWithEmailAndPassword(auth, email, password);
         const u = userCredential.user;
         
         if (!u.emailVerified) {
-          setAuthError('Please verify your email address before logging in.');
+          setAuthError(t.verifyBeforeLogin);
           setAuthMode('verify');
           return;
         }
@@ -705,7 +827,7 @@ export default function App() {
         profile = {
           uid: u.uid,
           name: u.displayName || 'Explorer',
-          email: u.email,
+          email: u.email || '',
           role: 'client',
           readingLevel: '',
           createdAt: new Date().toISOString()
@@ -727,6 +849,18 @@ export default function App() {
   };
 
   const trackReading = async (bookId: string, isOwner: boolean) => {
+    if (!user && bookId) {
+      setLocalRecentReads(prev => {
+        const next = [bookId, ...prev.filter(id => id !== bookId)].slice(0, 10);
+        try {
+          localStorage.setItem('recentReads', JSON.stringify(next));
+        } catch {
+          // storage full/unavailable: keep in memory only
+        }
+        return next;
+      });
+      return;
+    }
     if (user && bookId) {
       const userPath = `users/${user.uid}`;
       const storyPath = `stories/${bookId}`;
@@ -796,7 +930,7 @@ export default function App() {
     generatePageAssets(0, book);
     
     if (book.id) {
-      trackReading(book.id, book.uid === user?.uid);
+      trackReading(book.id, isMyBook(book));
     }
   };
 
@@ -815,6 +949,7 @@ export default function App() {
       setLevel(''); // Fixed: level is a string
     } catch (error) {
       console.error(error);
+      alert(t.failedToLoadWords);
       setState('home');
     }
   };
@@ -894,7 +1029,7 @@ export default function App() {
       const path = `users/${user.uid}`;
       try {
         await updateDoc(doc(db, path), cleanData({ readingLevel: newLevel }));
-        setUserProfile(prev => ({ ...prev, readingLevel: newLevel }));
+        setUserProfile((prev: any) => ({ ...prev, readingLevel: newLevel }));
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, path);
       }
@@ -934,39 +1069,53 @@ export default function App() {
           handleFirestoreError(error, OperationType.WRITE, path);
         }
       } else {
-        setStory(storyWithUid);
+        // Guests: keep the book on this device with a local id so later updates
+        // (illustrations, narration) and "recently read" can find it.
+        const localStory = { ...storyWithUid, id: newLocalId() } as Story;
+        setStory(localStory);
         setCurrentPage(0);
         setState('reading-choice');
-        generatePageAssets(0, storyWithUid);
-        const newMyBooks = [storyWithUid as Story, ...myBooks];
+        generatePageAssets(0, localStory);
+        trackReading(localStory.id!, true);
+        const newMyBooks = [localStory, ...myBooks];
         setMyBooks(newMyBooks);
-        localStorage.setItem('myBooks', JSON.stringify(newMyBooks));
-        
-        const newAllBooks = [storyWithUid as Story, ...allBooks];
+        saveBooksLocally('myBooks', newMyBooks);
+        const newAllBooks = [localStory, ...allBooks];
         setAllBooks(newAllBooks);
-        localStorage.setItem('allBooks', JSON.stringify(newAllBooks));
+        saveBooksLocally('allBooks', newAllBooks);
       }
     } catch (error) {
       console.error(error);
+      alert(t.failedToCreate);
       setState('config');
     }
   };
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Reset so picking the same file again still fires onChange.
+    e.target.value = '';
     if (!file) return;
+    if (file.size > MAX_IMPORT_BYTES) {
+      alert(t.fileTooLarge);
+      return;
+    }
 
     setState('loading');
     setLoadingMessage(t.readingStory);
     try {
+      // pdf.js and mammoth are large; load them only when someone imports a file.
+      const { parsePdf, parseDocx, truncateText } = await import('./services/fileParser');
+      const name = file.name.toLowerCase();
       let text = '';
-      if (file.type === 'application/pdf') {
+      if (file.type === 'application/pdf' || name.endsWith('.pdf')) {
         text = await parsePdf(file);
-      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || name.endsWith('.docx')) {
         text = await parseDocx(file);
       } else {
         text = await file.text();
       }
+      if (!text.trim()) throw new Error('No readable text in file');
 
       const truncated = truncateText(text, 500);
       const importedStory = await processImportedStory(truncated, currentLanguage);
@@ -988,17 +1137,20 @@ export default function App() {
           handleFirestoreError(error, OperationType.WRITE, path);
         }
       } else {
-        setStory(storyWithUid);
+        // Guests: keep the book on this device with a local id so later updates
+        // (illustrations, narration) and "recently read" can find it.
+        const localStory = { ...storyWithUid, id: newLocalId() } as Story;
+        setStory(localStory);
         setCurrentPage(0);
         setState('reading-choice');
-        generatePageAssets(0, storyWithUid);
-        const newMyBooks = [storyWithUid as Story, ...myBooks];
+        generatePageAssets(0, localStory);
+        trackReading(localStory.id!, true);
+        const newMyBooks = [localStory, ...myBooks];
         setMyBooks(newMyBooks);
-        localStorage.setItem('myBooks', JSON.stringify(newMyBooks));
-
-        const newAllBooks = [storyWithUid as Story, ...allBooks];
+        saveBooksLocally('myBooks', newMyBooks);
+        const newAllBooks = [localStory, ...allBooks];
         setAllBooks(newAllBooks);
-        localStorage.setItem('allBooks', JSON.stringify(newAllBooks));
+        saveBooksLocally('allBooks', newAllBooks);
       }
     } catch (error) {
       console.error("Import error:", error);
@@ -1054,33 +1206,25 @@ export default function App() {
           const updatedStory = { ...prev, pages: newPages };
           
           // Persist changes
-          if (user && updatedStory.id) {
+          if (user && updatedStory.id && updatedStory.uid === user.uid) {
             // Save heavy assets to subcollection to avoid 1MB document limit
             // We split image and audio into separate documents to double the available space
             const imagePath = `stories/${updatedStory.id}/assets/${idx}_image`;
             const audioPath = `stories/${updatedStory.id}/assets/${idx}_audio`;
             
-            if (page.imageUrl) {
+            if (page.imageUrl && needsImage) {
               setDoc(doc(db, imagePath), cleanData({ uid: user.uid, imageUrl: page.imageUrl })).catch(err => {
                 console.error(`Error updating image asset for page ${idx}:`, err);
               });
             }
             
-            if (page.audioData) {
-              setDoc(doc(db, audioPath), cleanData({ uid: user.uid, audioData: page.audioData })).catch(err => {
-                console.error(`Error updating audio asset for page ${idx}:`, err);
-              });
+            if (page.audioData && needsAudio) {
+              saveNarrationAsset(user.uid, updatedStory.id, idx, audioPath, page.audioData);
             }
 
             // Update main document but keep it small
             // We only keep the cover image (page 0) in the main document for the Explore view
-            const pagesForMainDoc = newPages.map((p, i) => {
-              const { imageUrl, audioData, ...rest } = p;
-              if (i === 0 && imageUrl) {
-                return { ...rest, imageUrl };
-              }
-              return rest;
-            });
+            const pagesForMainDoc = stripPageAssets(newPages);
 
             const path = `stories/${updatedStory.id}`;
             updateDoc(doc(db, path), cleanData({ pages: pagesForMainDoc })).catch(err => {
@@ -1089,18 +1233,18 @@ export default function App() {
           } else {
             // Update local storage for non-logged in users
             const updateLocal = (list: Story[]) => {
-              return list.map(b => b.title === updatedStory.title ? updatedStory : b);
+              return list.map(b => b.id === updatedStory.id ? updatedStory : b);
             };
             
             setMyBooks(prevMy => {
               const updated = updateLocal(prevMy);
-              localStorage.setItem('myBooks', JSON.stringify(updated));
+              saveBooksLocally('myBooks', updated);
               return updated;
             });
             
             setAllBooks(prevAll => {
               const updated = updateLocal(prevAll);
-              localStorage.setItem('allBooks', JSON.stringify(updated));
+              saveBooksLocally('allBooks', updated);
               return updated;
             });
           }
@@ -1143,47 +1287,13 @@ export default function App() {
     prefetch();
   };
 
-  const playAudio = (base64: string, text: string, onEnded?: () => void) => {
+  const playAudio = (narration: string, text: string, onEnded?: () => void) => {
     stopAudio();
     try {
-      const binaryString = window.atob(base64);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-
-      const isWav = binaryString.startsWith('RIFF');
-      const isMp3 = binaryString.startsWith('ID3') || (bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0);
-
-      let blob: Blob;
-      if (isWav) {
-        blob = new Blob([bytes], { type: 'audio/wav' });
-      } else if (isMp3) {
-        blob = new Blob([bytes], { type: 'audio/mpeg' });
-      } else {
-        const header = new ArrayBuffer(44);
-        const view = new DataView(header);
-        view.setUint32(0, 0x52494646, false);
-        view.setUint32(4, 36 + len, true);
-        view.setUint32(8, 0x57415645, false);
-        view.setUint32(12, 0x666d7420, false);
-        view.setUint32(16, 16, true);
-        view.setUint16(20, 1, true);
-        view.setUint16(22, 1, true);
-        view.setUint32(24, 24000, true);
-        view.setUint32(28, 24000 * 2, true);
-        view.setUint16(32, 2, true);
-        view.setUint16(34, 16, true);
-        view.setUint32(36, 0x64617461, false);
-        view.setUint32(40, len, true);
-        const wavBytes = new Uint8Array(44 + len);
-        wavBytes.set(new Uint8Array(header), 0);
-        wavBytes.set(bytes, 44);
-        blob = new Blob([wavBytes], { type: 'audio/wav' });
-      }
-
-      const url = URL.createObjectURL(blob);
+      // Remote narration (Firebase Storage) plays directly; base64 is decoded locally.
+      const isRemote = isRemoteAudio(narration);
+      const url = isRemote ? narration : URL.createObjectURL(audioBlobFromBase64(narration));
+      const releaseUrl = () => { if (!isRemote) URL.revokeObjectURL(url); };
       const audio = new Audio(url);
       audioRef.current = audio;
       const words = text.split(/\s+/).filter(w => w.length > 0);
@@ -1202,7 +1312,7 @@ export default function App() {
 
       audio.onended = () => {
         setReadingWordIndex(null);
-        URL.revokeObjectURL(url);
+        releaseUrl();
         audioRef.current = null;
         if (onEnded) onEnded();
       };
@@ -1210,14 +1320,14 @@ export default function App() {
       audio.onerror = (e) => {
         console.error("Audio playback error:", e);
         setReadingWordIndex(null);
-        URL.revokeObjectURL(url);
+        releaseUrl();
         audioRef.current = null;
       };
       
       audio.play().catch(err => {
         console.error("Audio play failed:", err);
         setReadingWordIndex(null);
-        URL.revokeObjectURL(url);
+        releaseUrl();
         audioRef.current = null;
       });
     } catch (err) {
@@ -1244,19 +1354,33 @@ export default function App() {
         stopAudio();
       };
     }
+    // finishStory / generatePageAssets / playAudio are recreated every render; listing
+    // them would restart narration on every re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPage, state, readingMode, story, isGeneratingPage]);
 
   const handleSendMessage = async () => {
     if (!chatInput.trim()) return;
+    if (isChatLoading) return;
     const userMsg = chatInput;
+    const history = chatMessages;
     setChatInput('');
     setChatMessages(prev => [...prev, { role: 'user', text: userMsg }]);
     setIsChatLoading(true);
+    // Give the helper the story being read so "who is Leo?" style questions work.
+    const storyContext = story && (state === 'reading' || state === 'reading-choice')
+      ? [
+          `Title: ${story.title}`,
+          ...story.pages.map((p, i) => `Page ${i + 1}: ${p.text}`),
+          `(The child is on page ${currentPage + 1}.)`
+        ].join('\n')
+      : undefined;
     try {
-      const aiResponse = await chatWithGemini(userMsg, [], currentLanguage);
+      const aiResponse = await chatWithGemini(userMsg, history, currentLanguage, storyContext);
       setChatMessages(prev => [...prev, { role: 'ai', text: aiResponse || 'I am not sure how to answer that.' }]);
     } catch (error) {
       console.error(error);
+      setChatMessages(prev => [...prev, { role: 'ai', text: t.somethingWentWrong }]);
     } finally {
       setIsChatLoading(false);
     }
@@ -1264,12 +1388,17 @@ export default function App() {
 
   const handleWordClick = async (word: string) => {
     // Clean word from punctuation
-    const cleanWord = word.replace(/[.,!?;:()"]/g, '');
+    const cleanWord = (word || '').replace(/[.,!?;:()"“”‘’«»¿¡。，！？；：、]/g, '');
+    if (!cleanWord) return;
     setSelectedWord(cleanWord);
+    setWordDetails(null);
     
     // Check if word is in current page annotations
-    if (story && story.pages[currentPage].annotations) {
-      const annotation = story.pages[currentPage].annotations.find(a => a.word.toLowerCase() === cleanWord.toLowerCase());
+    const pageAnnotations = story?.pages[currentPage]?.annotations;
+    if (pageAnnotations) {
+      const annotation = pageAnnotations
+        .map(normalizeAnnotation)
+        .find(a => a && a.explanation && a.word.toLowerCase() === cleanWord.toLowerCase());
       if (annotation) {
         setWordDetails({
           explanation: annotation.explanation,
@@ -1365,7 +1494,7 @@ export default function App() {
 
   const NavButton = ({ id, label, icon: Icon }: { id: AppState, label: string, icon: any }) => (
     <button 
-      onClick={() => setState(id)}
+      onClick={() => { stopAudio(); setState(id); }}
       className={cn(
         "flex items-center gap-2 px-4 py-2 rounded-xl font-medium transition-all",
         state === id ? "bg-indigo-50 text-indigo-600" : "text-gray-600 hover:bg-gray-50"
@@ -1380,7 +1509,7 @@ export default function App() {
     <ErrorBoundary>
       <div className="min-h-screen bg-[#FDFCF0] text-[#2D3436] font-sans selection:bg-indigo-100">
       {/* Header */}
-      <header className="px-6 py-4 flex justify-between items-center border-b border-gray-100 bg-white sticky top-0 z-50">
+      <header className="px-4 md:px-6 py-4 flex justify-between items-center border-b border-gray-100 bg-white sticky top-0 z-50">
         <div className="flex items-center gap-2">
           <div className="bg-indigo-600 p-1.5 rounded-lg">
             <BookOpen className="text-white w-5 h-5" />
@@ -1388,13 +1517,14 @@ export default function App() {
           <h1 className="text-xl font-bold tracking-tight text-gray-900">StoryMe</h1>
         </div>
         
-        <nav className="hidden md:flex items-center gap-4">
-          <NavButton id="home" label={t.home} icon={HomeIcon} />
-          <NavButton id="my-books" label={t.myBooks} icon={Library} />
-          <NavButton id="explore" label={t.explore} icon={Sparkles} />
-          <NavButton id="progress" label={t.progress} icon={BarChart3} />
-          
-          <div className="flex items-center gap-2 ml-2 pr-4 border-r border-gray-100">
+        <nav className="flex items-center gap-2 md:gap-4">
+          <div className="hidden md:flex items-center gap-4">
+            <NavButton id="home" label={t.home} icon={HomeIcon} />
+            <NavButton id="my-books" label={t.myBooks} icon={Library} />
+            <NavButton id="explore" label={t.explore} icon={Sparkles} />
+            <NavButton id="progress" label={t.progress} icon={BarChart3} />
+          </div>
+          <div className="flex items-center gap-2 md:ml-2 md:pr-4 md:border-r border-gray-100">
             <select 
               value={currentLanguage}
               onChange={(e) => {
@@ -1402,7 +1532,8 @@ export default function App() {
                 setCurrentLanguage(newLang);
                 localStorage.setItem('appLanguage', newLang);
               }}
-              className="bg-gray-50 text-sm font-bold text-gray-600 outline-none cursor-pointer px-3 py-1.5 rounded-xl hover:bg-gray-100 transition-colors border border-gray-100"
+              aria-label="Language"
+              className="bg-gray-50 text-sm font-bold text-gray-600 outline-none cursor-pointer px-2 md:px-3 py-1.5 rounded-xl hover:bg-gray-100 transition-colors border border-gray-100"
             >
               <option value="English">English</option>
               <option value="French">Français</option>
@@ -1412,21 +1543,23 @@ export default function App() {
             </select>
           </div>
 
-          <div className="flex items-center gap-4 pl-4">
+          <div className="flex items-center gap-2 md:gap-4 md:pl-4">
             {user ? (
               <>
                 <div className="flex items-center gap-2">
                   <div className="w-8 h-8 bg-indigo-100 rounded-full flex items-center justify-center text-indigo-600 font-bold text-xs">
                     {user?.displayName?.[0] || 'U'}
                   </div>
-                  <span className="text-sm font-bold text-gray-700">{user?.displayName}</span>
+                  <span className="hidden sm:inline text-sm font-bold text-gray-700">{user?.displayName}</span>
                 </div>
                 <button 
                   onClick={async () => {
                     await signOut(auth);
                     setUser(null);
                     setUserProfile(null);
-                    setMyBooks([]);
+                    // Drop the signed-in library and show this device's guest books again.
+                    setMyBooks(loadBooksLocally('myBooks'));
+                    setAllBooks(loadBooksLocally('allBooks'));
                     setState('home');
                   }}
                   className="text-gray-400 hover:text-rose-500 transition-colors"
@@ -1441,17 +1574,17 @@ export default function App() {
                   setAuthMode('login');
                   setState('auth');
                 }}
-                className="bg-indigo-600 text-white px-6 py-2 rounded-xl font-bold hover:bg-indigo-700 transition-all flex items-center gap-2"
+                className="bg-indigo-600 text-white px-3 md:px-6 py-2 rounded-xl font-bold hover:bg-indigo-700 transition-all flex items-center gap-2 whitespace-nowrap"
               >
                 <User className="w-4 h-4" />
-                {t.logIn}
+                <span className="hidden sm:inline">{t.logIn}</span>
               </button>
             )}
           </div>
         </nav>
       </header>
 
-      <main className="relative">
+      <main className="relative pb-24 md:pb-0">
         <AnimatePresence mode="wait">
           {state === 'auth' && (
             <motion.div 
@@ -1483,10 +1616,14 @@ export default function App() {
                           if (auth.currentUser) {
                             await auth.currentUser.reload();
                             if (auth.currentUser.emailVerified) {
+                              // Refresh the ID token so security rules see email_verified = true.
+                              await auth.currentUser.getIdToken(true);
                               setUser(auth.currentUser);
+                              await loadProfile(auth.currentUser.uid);
+                              setAuthError('');
                               setState('home');
                             } else {
-                              setAuthError('Email not verified yet. Please check your inbox.');
+                              setAuthError(t.emailNotVerifiedYet);
                             }
                           }
                         }}
@@ -1589,7 +1726,7 @@ export default function App() {
               className="min-h-[calc(100vh-73px)]"
             >
               {/* Hero Section */}
-              <div className="relative h-[600px] flex flex-col items-center justify-center text-center px-6 overflow-hidden">
+              <div className="relative min-h-[480px] md:h-[600px] py-12 md:py-0 flex flex-col items-center justify-center text-center px-6 overflow-hidden">
                 <div className="absolute inset-0 -z-10 opacity-20 pointer-events-none">
                   <div className="absolute top-20 left-10 w-64 h-64 bg-pink-200 rounded-full blur-3xl" />
                   <div className="absolute bottom-20 right-10 w-96 h-96 bg-indigo-200 rounded-full blur-3xl" />
@@ -1604,7 +1741,7 @@ export default function App() {
                 <motion.h2 
                   initial={{ y: 20, opacity: 0 }}
                   animate={{ y: 0, opacity: 1 }}
-                  className="text-7xl font-serif font-bold text-gray-900 mb-6"
+                  className="text-5xl md:text-7xl font-serif font-bold text-gray-900 mb-6"
                 >
                   {t.heroTitle}
                 </motion.h2>
@@ -1622,7 +1759,7 @@ export default function App() {
                     <button 
                       onClick={() => {
                         resetStoryConfig();
-                        level ? setState('re-test-ask') : setState('welcome');
+                        setState(level ? 're-test-ask' : 'welcome');
                       }}
                       className="bg-[#2D3E50] hover:bg-[#1A2A3A] text-white px-10 py-5 rounded-2xl text-xl font-bold flex items-center gap-3 shadow-2xl transition-all hover:scale-105"
                     >
@@ -1647,10 +1784,10 @@ export default function App() {
                   <button onClick={() => setState('my-books')} className="text-indigo-600 font-bold hover:underline">{t.viewAll}</button>
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-8">
-                  {userProfile?.recentReads && userProfile.recentReads.length > 0 ? (
+                  {recentReads.length > 0 && allBooks.some(b => b.id && recentReads.includes(b.id)) ? (
                     allBooks
-                      .filter(b => userProfile.recentReads.includes(b.id))
-                      .sort((a, b) => userProfile.recentReads.indexOf(a.id) - userProfile.recentReads.indexOf(b.id))
+                      .filter(b => b.id && recentReads.includes(b.id))
+                      .sort((a, b) => recentReads.indexOf(a.id!) - recentReads.indexOf(b.id!))
                       .slice(0, 4)
                       .map((book, i) => (
                         <motion.div 
@@ -1687,7 +1824,7 @@ export default function App() {
                           </div>
                           <div className="p-6">
                             <h4 className="font-bold text-gray-900 mb-1 line-clamp-1">{book.title}</h4>
-                            <p className="text-sm text-gray-400">{t.by} {book.uid === user?.uid ? t.you : t.explorer}</p>
+                            <p className="text-sm text-gray-400">{t.by} {isMyBook(book) ? t.you : t.explorer}</p>
                           </div>
                         </motion.div>
                       ))
@@ -1736,7 +1873,7 @@ export default function App() {
               <div className="bg-amber-50 p-6 rounded-3xl flex items-start gap-4 text-left">
                 <AlertCircle className="w-6 h-6 text-amber-600 shrink-0" />
                 <p className="text-amber-800 text-sm">
-                  <strong>Tip:</strong> {t.importTip}
+                  <strong>{t.tip}:</strong> {t.importTip}
                 </p>
               </div>
 
@@ -1757,7 +1894,7 @@ export default function App() {
               className="max-w-6xl mx-auto px-6 py-12"
             >
               <div className="text-center space-y-4 mb-12">
-                <h2 className="text-6xl font-serif font-bold text-gray-900">{t.doYouKnowWord}</h2>
+                <h2 className="text-4xl md:text-6xl font-serif font-bold text-gray-900">{t.doYouKnowWord}</h2>
                 <p className="text-xl text-gray-500">{t.findReadingLevel}</p>
               </div>
 
@@ -1860,7 +1997,7 @@ export default function App() {
                   <button 
                     onClick={() => {
                       resetStoryConfig();
-                      level ? setState('re-test-ask') : setState('welcome');
+                      setState(level ? 're-test-ask' : 'welcome');
                     }}
                     className="bg-[#2D3E50] hover:bg-[#1A2A3A] text-white px-8 py-4 rounded-2xl font-bold flex items-center gap-2 shadow-xl"
                   >
@@ -1964,7 +2101,8 @@ export default function App() {
                   {(() => {
                     // Group books by fixed categories
                     const grouped = allBooks.reduce((acc, book) => {
-                      const categoryKey = categorizeBook(book.subject || 'General');
+                      // Older stories have no subject; fall back to the title so they still spread across categories.
+                      const categoryKey = categorizeBook(book.subject || book.title || '');
                       if (!acc[categoryKey]) acc[categoryKey] = [];
                       acc[categoryKey].push(book);
                       return acc;
@@ -2027,7 +2165,7 @@ export default function App() {
                                 <div className="p-6">
                                   <h4 className="font-bold text-gray-900 mb-1 line-clamp-1">{book.title}</h4>
                                   <div className="flex justify-between items-center">
-                                    <p className="text-sm text-gray-400">{t.by} {book.uid === user?.uid ? t.you : t.explorer}</p>
+                                    <p className="text-sm text-gray-400">{t.by} {isMyBook(book) ? t.you : t.explorer}</p>
                                     <p className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg">{translateLevel(book.level || 'Word Explorer')}</p>
                                   </div>
                                 </div>
@@ -2079,26 +2217,27 @@ export default function App() {
               exit={{ opacity: 0 }}
               className="max-w-3xl mx-auto px-6 py-12 space-y-12"
             >
-              {!user ? (
-                <div className="py-32 text-center space-y-8 bg-white p-12 rounded-[40px] border border-gray-100 shadow-sm">
-                  <div className="bg-indigo-50 w-24 h-24 rounded-full flex items-center justify-center mx-auto">
-                    <BarChart3 className="w-12 h-12 text-indigo-600" />
+              {/* Guests still see their (local) stamps, streak and word list; signing in just syncs them. */}
+              {!user && (
+                <div className="bg-white p-6 sm:p-8 rounded-[32px] border border-gray-100 shadow-sm flex flex-col sm:flex-row items-center gap-6 text-center sm:text-left">
+                  <div className="bg-indigo-50 w-16 h-16 rounded-full flex items-center justify-center shrink-0">
+                    <BarChart3 className="w-8 h-8 text-indigo-600" />
                   </div>
-                  <div className="space-y-4 max-w-md mx-auto">
-                    <h3 className="text-3xl font-bold text-gray-900">{t.trackProgress}</h3>
-                    <p className="text-gray-500 text-lg">{t.signInToSave}</p>
-                    <button 
-                      onClick={() => {
-                        setAuthMode('login');
-                        setState('auth');
-                      }}
-                      className="bg-indigo-600 text-white px-10 py-5 rounded-2xl font-bold text-xl shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all"
-                    >
-                      {t.logIn} / {t.signUp}
-                    </button>
+                  <div className="flex-1 space-y-1">
+                    <h3 className="text-xl font-bold text-gray-900">{t.trackProgress}</h3>
+                    <p className="text-gray-500">{t.signInToSave}</p>
                   </div>
+                  <button 
+                    onClick={() => {
+                      setAuthMode('login');
+                      setState('auth');
+                    }}
+                    className="bg-indigo-600 text-white px-6 py-3 rounded-2xl font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all shrink-0"
+                  >
+                    {t.logIn} / {t.signUp}
+                  </button>
                 </div>
-              ) : (
+              )}
                 <>
                   <div className="flex items-center justify-between">
                     <h2 className="text-4xl font-serif font-bold text-gray-900">
@@ -2334,7 +2473,6 @@ export default function App() {
                 )}
               </AnimatePresence>
                 </>
-              )}
             </motion.div>
           )}
 
@@ -2880,22 +3018,22 @@ export default function App() {
               key="reading"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="max-w-7xl mx-auto px-6 py-12 space-y-10"
+              className="max-w-7xl mx-auto px-4 md:px-6 py-8 md:py-12 pb-32 md:pb-36 space-y-6 md:space-y-10"
             >
-              <div className="flex justify-between items-center bg-white p-6 rounded-[32px] border border-gray-100 shadow-sm relative z-10">
-                <div className="flex items-center gap-6">
+              <div className="flex justify-between items-center gap-3 bg-white p-3 md:p-6 rounded-[32px] border border-gray-100 shadow-sm relative z-10">
+                <div className="flex items-center gap-2 md:gap-6 min-w-0">
                   <button 
-                    onClick={() => setState('my-books')}
-                    className="p-3 hover:bg-gray-50 rounded-2xl text-gray-400 transition-colors"
+                    onClick={() => { stopAudio(); setState('my-books'); }}
+                    className="p-2 md:p-3 hover:bg-gray-50 rounded-2xl text-gray-400 transition-colors shrink-0"
                   >
-                    <ChevronLeft className="w-8 h-8" />
+                    <ChevronLeft className="w-6 h-6 md:w-8 md:h-8" />
                   </button>
-                  <h3 className="text-3xl font-black text-gray-900">{story.title}</h3>
+                  <h3 className="text-lg md:text-3xl font-black text-gray-900 truncate">{story.title}</h3>
                 </div>
-                <div className="text-indigo-600 font-bold bg-indigo-50 px-6 py-3 rounded-2xl text-lg">{t.page} {currentPage + 1} {t.of} {story.pages.length}</div>
+                <div className="shrink-0 text-indigo-600 font-bold bg-indigo-50 px-3 md:px-6 py-2 md:py-3 rounded-2xl text-sm md:text-lg">{t.page} {currentPage + 1} {t.of} {story.pages.length}</div>
               </div>
 
-              <div className="relative overflow-hidden min-h-[700px] perspective-[2000px]">
+              <div className="relative overflow-hidden min-h-[500px] md:min-h-[700px] perspective-[2000px]">
                 <AnimatePresence mode="popLayout" custom={direction}>
                   <motion.div 
                     key={currentPage}
@@ -2904,7 +3042,7 @@ export default function App() {
                     initial="initial"
                     animate="animate"
                     exit="exit"
-                    className="grid lg:grid-cols-2 gap-16 w-full"
+                    className="grid lg:grid-cols-2 gap-8 lg:gap-16 w-full"
                   >
                     {/* Illustration */}
                     <div className="relative aspect-square bg-white rounded-[60px] shadow-2xl shadow-indigo-100 border-8 border-white overflow-hidden group">
@@ -2935,7 +3073,7 @@ export default function App() {
                     <div className="flex flex-col justify-center space-y-12">
                       <div className="space-y-10">
                         <div className="relative">
-                          <div className="text-4xl font-bold text-gray-900 leading-[1.4] flex flex-wrap gap-x-3 gap-y-2">
+                          <div className="text-2xl md:text-4xl font-bold text-gray-900 leading-[1.4] pr-20 flex flex-wrap gap-x-3 gap-y-2">
                             {story.pages[currentPage].text.split(/\s+/).filter(w => w.length > 0).map((word, i) => (
                               <span 
                                 key={i} 
@@ -2950,7 +3088,7 @@ export default function App() {
                             ))}
                           </div>
                           {!story.pages[currentPage].audioData ? (
-                            <div className="absolute -right-6 -top-6 bg-gray-100 text-gray-400 p-4 rounded-[24px] shadow-sm animate-pulse">
+                            <div className="absolute right-0 top-0 bg-gray-100 text-gray-400 p-4 rounded-[24px] shadow-sm animate-pulse">
                               <Loader2 className="w-6 h-6 animate-spin" />
                             </div>
                           ) : (
@@ -2962,7 +3100,7 @@ export default function App() {
                                   playAudio(story.pages[currentPage].audioData!, story.pages[currentPage].text);
                                 }
                               }}
-                              className="absolute -right-6 -top-6 bg-indigo-600 text-white p-4 rounded-[24px] shadow-2xl hover:scale-110 active:scale-95 transition-all"
+                              className="absolute right-0 top-0 bg-indigo-600 text-white p-4 rounded-[24px] shadow-2xl hover:scale-110 active:scale-95 transition-all"
                             >
                               {readingWordIndex !== null ? <Square className="w-6 h-6" /> : <Volume2 className="w-6 h-6" />}
                             </button>
@@ -2994,13 +3132,13 @@ export default function App() {
                               </div>
                             </div>
                           )}
-                          {story.pages[currentPage].annotations && story.pages[currentPage].annotations.length > 0 && (
+                          {(story.pages[currentPage].annotations || []).some(a => normalizeAnnotation(a)) && (
                             <div className="space-y-4">
                               <h4 className="text-sm font-black text-gray-400 uppercase tracking-widest flex items-center gap-2">
                                 <Sparkles className="w-4 h-4" /> {t.annotations}
                               </h4>
                               <div className="space-y-3">
-                                {story.pages[currentPage].annotations.map((a, i) => (
+                                {(story.pages[currentPage].annotations || []).map(normalizeAnnotation).filter((a): a is NonNullable<typeof a> => a !== null).map((a, i) => (
                                   <button 
                                     key={i} 
                                     onClick={() => handleWordClick(a.word)}
@@ -3018,7 +3156,7 @@ export default function App() {
                         <div className="h-px bg-gray-100 w-full" />
                       </div>
 
-                      <div className="flex gap-6 pt-10">
+                      <div className="flex gap-4 md:gap-6 pt-6 md:pt-10">
                         <button 
                           disabled={currentPage === 0}
                           onClick={() => {
@@ -3028,7 +3166,7 @@ export default function App() {
                             setCurrentPage(newPage);
                             generatePageAssets(newPage, story);
                           }}
-                          className="flex-1 bg-white border-2 border-gray-100 text-gray-500 py-6 rounded-[32px] font-bold text-xl disabled:opacity-30 flex items-center justify-center gap-3 hover:bg-gray-50 transition-colors"
+                          className="flex-1 bg-white border-2 border-gray-100 text-gray-500 py-4 md:py-6 rounded-[32px] font-bold text-lg md:text-xl disabled:opacity-30 flex items-center justify-center gap-3 hover:bg-gray-50 transition-colors"
                         >
                           <ChevronLeft className="w-6 h-6" /> {t.previous}
                         </button>
@@ -3044,7 +3182,7 @@ export default function App() {
                                 generatePageAssets(newPage, story);
                               }
                             }}
-                            className="flex-1 bg-indigo-600 text-white py-6 rounded-[32px] font-bold text-xl disabled:opacity-30 flex items-center justify-center gap-3 hover:bg-indigo-700 transition-all shadow-2xl shadow-indigo-100"
+                            className="flex-1 bg-indigo-600 text-white py-4 md:py-6 rounded-[32px] font-bold text-lg md:text-xl disabled:opacity-30 flex items-center justify-center gap-3 hover:bg-indigo-700 transition-all shadow-2xl shadow-indigo-100"
                           >
                             {currentPage === story.pages.length - 1 ? t.finishStory : t.next} <ChevronRight className="w-6 h-6" />
                           </button>
@@ -3084,7 +3222,7 @@ export default function App() {
                           <span className="text-sm font-bold uppercase tracking-widest">{t.loading}...</span>
                         </div>
                       ) : (
-                        <div className="text-xl font-medium text-gray-500 leading-relaxed">{wordDetails?.explanation}</div>
+                        <div className="text-xl font-medium text-gray-500 leading-relaxed">{wordDetails ? wordDetails.explanation : t.wordLookupFailed}</div>
                       )}
                     </div>
                     <button 
@@ -3097,22 +3235,18 @@ export default function App() {
 
                   {!isWordLoading && wordDetails && (
                     <div className="space-y-8">
-                      <div className="space-y-4 bg-gray-50 p-6 rounded-[32px] border border-gray-100">
-                        <div className="text-xs font-bold text-gray-400 uppercase tracking-widest">{t.exampleSentence}</div>
-                        <div className="space-y-2">
-                          <p className="text-xl font-bold text-gray-800 leading-relaxed">"{wordDetails.exampleSentence}"</p>
+                      {wordDetails.exampleSentence && (
+                        <div className="space-y-4 bg-gray-50 p-6 rounded-[32px] border border-gray-100">
+                          <div className="text-xs font-bold text-gray-400 uppercase tracking-widest">{t.exampleSentence}</div>
+                          <div className="space-y-2">
+                            <p className="text-xl font-bold text-gray-800 leading-relaxed">"{wordDetails.exampleSentence}"</p>
+                          </div>
                         </div>
-                      </div>
+                      )}
 
                       <div className="flex gap-4">
                         <button 
-                          onClick={() => {
-                            const audio = new Audio(`https://api.dictionaryapi.dev/media/pronunciations/en/${selectedWord.toLowerCase()}-us.mp3`);
-                            audio.play().catch(() => {
-                              const utterance = new SpeechSynthesisUtterance(selectedWord);
-                              window.speechSynthesis.speak(utterance);
-                            });
-                          }}
+                          onClick={() => speakWord(selectedWord, story?.language || currentLanguage)}
                           className="flex-1 bg-white border-2 border-gray-100 hover:border-indigo-200 text-gray-700 py-5 rounded-3xl font-bold flex items-center justify-center gap-3 transition-all"
                         >
                           <Volume2 className="w-6 h-6 text-indigo-500" />
@@ -3135,15 +3269,38 @@ export default function App() {
         </AnimatePresence>
       </main>
 
+      {/* Mobile tab bar (the header nav is desktop-only) */}
+      <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-gray-100 grid grid-cols-4 pb-[env(safe-area-inset-bottom)]">
+        {([
+          ['home', t.home, HomeIcon],
+          ['my-books', t.myBooks, Library],
+          ['explore', t.explore, Sparkles],
+          ['progress', t.progress, BarChart3],
+        ] as const).map(([id, label, Icon]) => (
+          <button
+            key={id}
+            onClick={() => { stopAudio(); setState(id); }}
+            className={cn(
+              "flex flex-col items-center gap-1 py-2 text-xs font-bold",
+              state === id ? "text-indigo-600" : "text-gray-500"
+            )}
+          >
+            <Icon className="w-5 h-5" />
+            <span className="truncate max-w-full px-1">{label}</span>
+          </button>
+        ))}
+      </nav>
+
       {/* Chatbot */}
-      <div className="fixed bottom-8 right-8 z-50">
+      <div className="fixed bottom-20 right-4 md:bottom-8 md:right-8 z-50">
         <AnimatePresence>
           {isChatOpen && (
             <motion.div 
               initial={{ opacity: 0, scale: 0.8, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.8, y: 20 }}
-              className="bg-white w-96 h-[550px] rounded-[40px] shadow-2xl border border-gray-100 flex flex-col overflow-hidden mb-6"
+              className="bg-white w-[calc(100vw-2rem)] max-w-96 h-[min(550px,calc(100vh-12rem))] rounded-[40px] shadow-2xl border border-gray-100 flex flex-col overflow-hidden mb-6"
+
             >
               <div className="bg-indigo-600 p-6 flex justify-between items-center text-white">
                 <div className="flex items-center gap-3">
@@ -3211,9 +3368,10 @@ export default function App() {
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}
           onClick={() => setIsChatOpen(!isChatOpen)}
-          className="bg-indigo-600 text-white p-6 rounded-[32px] shadow-2xl shadow-indigo-200 flex items-center justify-center"
+          aria-label={t.storyHelper}
+          className="ml-auto bg-indigo-600 text-white p-4 md:p-5 rounded-[24px] md:rounded-[28px] shadow-2xl shadow-indigo-200 flex items-center justify-center"
         >
-          {isChatOpen ? <X className="w-10 h-10" /> : <MessageCircle className="w-10 h-10" />}
+          {isChatOpen ? <X className="w-7 h-7 md:w-8 md:h-8" /> : <MessageCircle className="w-7 h-7 md:w-8 md:h-8" />}
         </motion.button>
       </div>
     </div>

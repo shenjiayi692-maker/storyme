@@ -14,7 +14,7 @@
 git clone https://github.com/shenjiayi692-maker/storyme && cd storyme && cp .env.example .env.local && npm i && npm run dev
 ```
 
-它会起来并告诉你要填哪个 key；生成功能需要 Gemini API key。
+不填 key 应用也能启动，但生成故事需要在 `.env.local` 里设置 `GEMINI_API_KEY`。
 
 StoryMe 是一个面向儿童的互动阅读伙伴。它先估计读者的阅读水平，让孩子挑选角色、地点、活动和价值观，然后生成一个五页的故事，配上插图、朗读、翻译、提问和生词帮助。
 
@@ -63,15 +63,17 @@ Gemini 负责结构化的故事文本、每页的配图提示、翻译、提问�
 | [`src/App.tsx`](./src/App.tsx) | 阅读水平评估、创作流程、阅读器、书架，以及持久化编排 |
 | [`src/services/gemini.ts`](./src/services/gemini.ts) | 故事、图像、语音、助手和词汇生成 |
 | [`src/services/fileParser.ts`](./src/services/fileParser.ts) | PDF 和 DOCX 抽取，含输入截断 |
-| [`src/services/authService.ts`](./src/services/authService.ts) | 邮箱与 Google 登录，以及读者档案 |
-| [`src/services/storageService.ts`](./src/services/storageService.ts) | 生成的图像与音频存储 |
+| [`src/services/storageService.ts`](./src/services/storageService.ts) | 把朗读音频上传到 Firebase Storage |
+| [`src/services/audio.ts`](./src/services/audio.ts) | 把存储的朗读音频（PCM/WAV/MP3）解码成可播放格式 |
 | [`src/translations.ts`](./src/translations.ts) | 五种语言的界面文案 |
 
 ## 安全与产品边界
 
 StoryMe 是一个原型，不是一套有人监督的识字课程。生成的故事、翻译、释义、图像、朗读和阅读水平估计都可能出错或不合适。家长、老师或看护者应在孩子使用前先行审阅生成的材料。
 
-公开部署之前必须复核 Firebase 的规则和配额。不要暴露不受限制的生成或存储端点，也不要把当前的阅读水平交互当作临床或教育评估。
+不用代理时，`GEMINI_API_KEY` 会被编译进前端代码，任何打开已部署页面的人都能看到它。在 AI Studio 以外公开部署时，请使用 [`proxy/`](./proxy/README.md) 里的 Cloudflare Worker 并设置 `GEMINI_PROXY_URL`，这样 key 只留在服务端。
+
+`firestore.rules` 和 `storage.rules` 不会因为推送到 GitHub 而生效，需要用 `firebase deploy --only firestore:rules,storage` 部署（或粘贴到 Firebase 控制台）。公开部署之前必须复核 Firebase 的规则和配额。不要暴露不受限制的生成或存储端点，也不要把当前的阅读水平交互当作临床或教育评估。
 
 ## 许可
 
