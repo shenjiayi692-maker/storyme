@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import React, { useState, useEffect, useRef, ReactNode } from 'react';
+import { motion, AnimatePresence, type Variants } from 'motion/react';
 import { 
   BookOpen, 
   Sparkles, 
@@ -25,7 +25,6 @@ import {
   BarChart3,
   LogOut,
   Plus,
-  Calendar,
   Zap,
   ChevronDown,
   Upload,
@@ -46,8 +45,9 @@ import {
   processImportedStory,
   getWordDetails,
   generateStoryOptions,
-  generateAllStoryOptions,
+  normalizeAnnotation,
   Story, 
+  StoryPage,
   WordSet,
   StoryOption
 } from './services/gemini';
@@ -77,7 +77,6 @@ import {
   onSnapshot, 
   query, 
   where, 
-  orderBy,
   getDocFromServer,
   getDocs
 } from 'firebase/firestore';
@@ -161,11 +160,8 @@ interface ErrorBoundaryState {
   error: Error | null;
 }
 
-class ErrorBoundary extends React.Component<any, any> {
-  constructor(props: any) {
-    super(props);
-    (this as any).state = { hasError: false, error: null };
-  }
+export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, error: null };
 
   static getDerivedStateFromError(error: Error) {
     return { hasError: true, error };
@@ -176,8 +172,7 @@ class ErrorBoundary extends React.Component<any, any> {
   }
 
   render() {
-    const state = (this as any).state;
-    const props = (this as any).props;
+    const { state, props } = this;
 
     if (state.hasError) {
       // Fallback to English if translations are not available
@@ -188,7 +183,7 @@ class ErrorBoundary extends React.Component<any, any> {
         if (parsedError.error) {
           errorMessage = `Database Error: ${parsedError.error}`;
         }
-      } catch (e) {
+      } catch {
         errorMessage = state.error?.message || errorMessage;
       }
 
@@ -216,10 +211,42 @@ class ErrorBoundary extends React.Component<any, any> {
 }
 // --- End Error Handling ---
 
+// Remove the heavy per-page assets (base64 image / narration audio), keeping only
+// the cover image on page 0. Used for the main Firestore story document and for
+// guest books in localStorage, both of which have tight size limits.
+function stripPageAssets(pages: StoryPage[]): StoryPage[] {
+  return pages.map((p, i) => {
+    const rest: StoryPage = { ...p };
+    delete rest.audioData;
+    if (i !== 0) delete rest.imageUrl;
+    return rest;
+  });
+}
+
+// Guest books live in localStorage (~5 MB per origin). Persist only the text and
+// cover; missing images/narration are regenerated when the book is opened. Never
+// let a quota error escape, since it would otherwise take down the whole app.
+function saveBooksLocally(key: 'myBooks' | 'allBooks', books: Story[]) {
+  try {
+    localStorage.setItem(key, JSON.stringify(books.map(b => ({ ...b, pages: stripPageAssets(b.pages) }))));
+  } catch (err) {
+    console.warn(`Could not save ${key} to localStorage:`, err);
+  }
+}
+
+function loadBooksLocally(key: 'myBooks' | 'allBooks'): Story[] {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
 type AppState = 'home' | 'my-books' | 'explore' | 'progress' | 'welcome' | 'testing' | 'test-result' | 'config' | 'reading' | 'loading' | 'import' | 'auth' | 'reading-choice' | 're-test-ask';
 type AuthMode = 'login' | 'signup' | 'verify';
 
-const pageVariants = {
+const pageVariants: Variants = {
   initial: (direction: number) => ({
     x: direction > 0 ? '100%' : '-100%',
     rotateY: direction > 0 ? 45 : -45,
@@ -471,11 +498,8 @@ export default function App() {
     setLastCompletedDate(storedLastDate);
 
     // Load local books
-    const storedMyBooks = localStorage.getItem('myBooks');
-    if (storedMyBooks) setMyBooks(JSON.parse(storedMyBooks));
-    
-    const storedAllBooks = localStorage.getItem('allBooks');
-    if (storedAllBooks) setAllBooks(JSON.parse(storedAllBooks));
+    setMyBooks(loadBooksLocally('myBooks'));
+    setAllBooks(loadBooksLocally('allBooks'));
 
     return () => unsubscribe();
   }, []);
@@ -548,6 +572,8 @@ export default function App() {
     if ((state === 'config' || state === 'welcome' || state === 're-test-ask') && configOptions.characters.length === 0) {
       refreshAllOptions();
     }
+    // Only re-run when the screen changes; refreshAllOptions is recreated every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
   const refreshAllOptions = async () => {
@@ -611,7 +637,7 @@ export default function App() {
           // Use webp if possible, fallback to jpeg
           try {
             resolve(canvas.toDataURL('image/webp', quality));
-          } catch (e) {
+          } catch {
             resolve(canvas.toDataURL('image/jpeg', quality));
           }
         } else {
@@ -894,7 +920,7 @@ export default function App() {
       const path = `users/${user.uid}`;
       try {
         await updateDoc(doc(db, path), cleanData({ readingLevel: newLevel }));
-        setUserProfile(prev => ({ ...prev, readingLevel: newLevel }));
+        setUserProfile((prev: any) => ({ ...prev, readingLevel: newLevel }));
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, path);
       }
@@ -940,11 +966,11 @@ export default function App() {
         generatePageAssets(0, storyWithUid);
         const newMyBooks = [storyWithUid as Story, ...myBooks];
         setMyBooks(newMyBooks);
-        localStorage.setItem('myBooks', JSON.stringify(newMyBooks));
+        saveBooksLocally('myBooks', newMyBooks);
         
         const newAllBooks = [storyWithUid as Story, ...allBooks];
         setAllBooks(newAllBooks);
-        localStorage.setItem('allBooks', JSON.stringify(newAllBooks));
+        saveBooksLocally('allBooks', newAllBooks);
       }
     } catch (error) {
       console.error(error);
@@ -994,11 +1020,11 @@ export default function App() {
         generatePageAssets(0, storyWithUid);
         const newMyBooks = [storyWithUid as Story, ...myBooks];
         setMyBooks(newMyBooks);
-        localStorage.setItem('myBooks', JSON.stringify(newMyBooks));
+        saveBooksLocally('myBooks', newMyBooks);
 
         const newAllBooks = [storyWithUid as Story, ...allBooks];
         setAllBooks(newAllBooks);
-        localStorage.setItem('allBooks', JSON.stringify(newAllBooks));
+        saveBooksLocally('allBooks', newAllBooks);
       }
     } catch (error) {
       console.error("Import error:", error);
@@ -1074,13 +1100,7 @@ export default function App() {
 
             // Update main document but keep it small
             // We only keep the cover image (page 0) in the main document for the Explore view
-            const pagesForMainDoc = newPages.map((p, i) => {
-              const { imageUrl, audioData, ...rest } = p;
-              if (i === 0 && imageUrl) {
-                return { ...rest, imageUrl };
-              }
-              return rest;
-            });
+            const pagesForMainDoc = stripPageAssets(newPages);
 
             const path = `stories/${updatedStory.id}`;
             updateDoc(doc(db, path), cleanData({ pages: pagesForMainDoc })).catch(err => {
@@ -1094,13 +1114,13 @@ export default function App() {
             
             setMyBooks(prevMy => {
               const updated = updateLocal(prevMy);
-              localStorage.setItem('myBooks', JSON.stringify(updated));
+              saveBooksLocally('myBooks', updated);
               return updated;
             });
             
             setAllBooks(prevAll => {
               const updated = updateLocal(prevAll);
-              localStorage.setItem('allBooks', JSON.stringify(updated));
+              saveBooksLocally('allBooks', updated);
               return updated;
             });
           }
@@ -1146,7 +1166,9 @@ export default function App() {
   const playAudio = (base64: string, text: string, onEnded?: () => void) => {
     stopAudio();
     try {
-      const binaryString = window.atob(base64);
+      // Stored narration may be a bare base64 string or a data URL ("data:...;base64,<payload>").
+      const payload = base64.startsWith('data:') ? base64.slice(base64.indexOf(',') + 1) : base64;
+      const binaryString = window.atob(payload);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
@@ -1244,6 +1266,9 @@ export default function App() {
         stopAudio();
       };
     }
+    // finishStory / generatePageAssets / playAudio are recreated every render; listing
+    // them would restart narration on every re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPage, state, readingMode, story, isGeneratingPage]);
 
   const handleSendMessage = async () => {
@@ -1264,12 +1289,17 @@ export default function App() {
 
   const handleWordClick = async (word: string) => {
     // Clean word from punctuation
-    const cleanWord = word.replace(/[.,!?;:()"]/g, '');
+    const cleanWord = (word || '').replace(/[.,!?;:()"“”‘’«»¿¡。，！？；：、]/g, '');
+    if (!cleanWord) return;
     setSelectedWord(cleanWord);
+    setWordDetails(null);
     
     // Check if word is in current page annotations
-    if (story && story.pages[currentPage].annotations) {
-      const annotation = story.pages[currentPage].annotations.find(a => a.word.toLowerCase() === cleanWord.toLowerCase());
+    const pageAnnotations = story?.pages[currentPage]?.annotations;
+    if (pageAnnotations) {
+      const annotation = pageAnnotations
+        .map(normalizeAnnotation)
+        .find(a => a && a.explanation && a.word.toLowerCase() === cleanWord.toLowerCase());
       if (annotation) {
         setWordDetails({
           explanation: annotation.explanation,
@@ -1622,7 +1652,7 @@ export default function App() {
                     <button 
                       onClick={() => {
                         resetStoryConfig();
-                        level ? setState('re-test-ask') : setState('welcome');
+                        setState(level ? 're-test-ask' : 'welcome');
                       }}
                       className="bg-[#2D3E50] hover:bg-[#1A2A3A] text-white px-10 py-5 rounded-2xl text-xl font-bold flex items-center gap-3 shadow-2xl transition-all hover:scale-105"
                     >
@@ -1860,7 +1890,7 @@ export default function App() {
                   <button 
                     onClick={() => {
                       resetStoryConfig();
-                      level ? setState('re-test-ask') : setState('welcome');
+                      setState(level ? 're-test-ask' : 'welcome');
                     }}
                     className="bg-[#2D3E50] hover:bg-[#1A2A3A] text-white px-8 py-4 rounded-2xl font-bold flex items-center gap-2 shadow-xl"
                   >
@@ -2994,13 +3024,13 @@ export default function App() {
                               </div>
                             </div>
                           )}
-                          {story.pages[currentPage].annotations && story.pages[currentPage].annotations.length > 0 && (
+                          {(story.pages[currentPage].annotations || []).some(a => normalizeAnnotation(a)) && (
                             <div className="space-y-4">
                               <h4 className="text-sm font-black text-gray-400 uppercase tracking-widest flex items-center gap-2">
                                 <Sparkles className="w-4 h-4" /> {t.annotations}
                               </h4>
                               <div className="space-y-3">
-                                {story.pages[currentPage].annotations.map((a, i) => (
+                                {(story.pages[currentPage].annotations || []).map(normalizeAnnotation).filter((a): a is NonNullable<typeof a> => a !== null).map((a, i) => (
                                   <button 
                                     key={i} 
                                     onClick={() => handleWordClick(a.word)}

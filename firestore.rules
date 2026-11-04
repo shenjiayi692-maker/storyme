@@ -50,10 +50,17 @@ service cloud.firestore {
     }
 
     function isAdmin() {
+      // Email-based admin access requires a verified email; otherwise anyone could
+      // sign up with that address (email/password) and gain admin rights.
       return isAuthenticated() &&
         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-          (request.auth.token.email == "shenjiayi692@gmail.com" && request.auth.token.email_verified == true) ||
-          (request.auth.token.email == "shenjiayi@gmail.com"));
+          (request.auth.token.email_verified == true &&
+            request.auth.token.email in ["shenjiayi692@gmail.com", "shenjiayi@gmail.com"]));
+    }
+
+    function isStoryOwner(storyId) {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/stories/$(storyId)).data.uid == request.auth.uid;
     }
 
     function uidUnchanged() {
@@ -113,7 +120,8 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isAuthenticated();
+      // Profiles hold a child's name and email: only the owner (or an admin) may read them.
+      allow read: if isOwner(userId) || isAdmin();
       allow create: if isOwner(userId) && hasRequiredFields(['uid', 'name', 'email', 'role']) && isValidUserProfile(request.resource.data) && request.resource.data.role == 'client';
       allow update: if (isOwner(userId) && isValidUserProfile(request.resource.data) && uidNotModified() && request.resource.data.role == resource.data.role) || isAdmin();
     }
@@ -127,8 +135,9 @@ service cloud.firestore {
 
       match /assets/{pageIndex} {
         allow read: if isAuthenticated();
-        allow create: if isAuthenticated() && request.resource.data.uid == request.auth.uid;
-        allow update: if (isAuthenticated() && resource.data.uid == request.auth.uid && (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid)) || isAdmin();
+        // Only the owner of the parent story may attach images/audio to it.
+        allow create: if isStoryOwner(storyId) && request.resource.data.uid == request.auth.uid;
+        allow update: if (isStoryOwner(storyId) && resource.data.uid == request.auth.uid && (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid)) || isAdmin();
         allow delete: if (isAuthenticated() && resource.data.uid == request.auth.uid) || isAdmin();
       }
     }

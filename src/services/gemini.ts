@@ -8,8 +8,33 @@ export interface StoryPage {
   audioData?: string;
   imagePrompt?: string;
   translation?: string;
-  questions?: any[];
-  annotations?: any[];
+  questions?: string[];
+  annotations?: (Annotation | string)[];
+}
+
+export interface Annotation {
+  word: string;
+  explanation: string;
+}
+
+/**
+ * Older stories stored annotations as plain strings ("word: explanation");
+ * newer ones store { word, explanation }. Normalize both shapes.
+ */
+export function normalizeAnnotation(a: Annotation | string | null | undefined): Annotation | null {
+  if (!a) return null;
+  if (typeof a === 'string') {
+    const m = a.match(/^\s*([^:\-–—]+?)\s*[:\-–—]\s*(.+)$/);
+    return m ? { word: m[1].trim(), explanation: m[2].trim() } : { word: a.trim(), explanation: '' };
+  }
+  if (typeof a.word !== 'string' || !a.word.trim()) return null;
+  return { word: a.word, explanation: typeof a.explanation === 'string' ? a.explanation : '' };
+}
+
+export interface WordDetails {
+  explanation: string;
+  exampleSentence: string;
+  pronunciation?: string;
 }
 
 export interface Story {
@@ -74,7 +99,7 @@ export async function generateStory(
     Locations: ${locations.join(", ")}. ${locationDetails}
     Activities: ${activities}
     Values: ${values.join(", ")}
-    Return as JSON with 'title' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations').`,
+    Return as JSON with 'title' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations'). 'annotations' lists 1-3 harder words from the page, each with 'word' (exactly as it appears in the text) and a short child-friendly 'explanation'.`,
     config: { 
       responseMimeType: "application/json",
       responseSchema: {
@@ -90,7 +115,17 @@ export async function generateStory(
                 imagePrompt: { type: Type.STRING },
                 translation: { type: Type.STRING },
                 questions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                annotations: { type: Type.ARRAY, items: { type: Type.STRING } }
+                annotations: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      word: { type: Type.STRING },
+                      explanation: { type: Type.STRING }
+                    },
+                    required: ["word", "explanation"]
+                  }
+                }
               },
               required: ["text", "imagePrompt", "translation", "questions", "annotations"]
             }
@@ -145,7 +180,8 @@ export async function generateSpeech(text: string): Promise<string> {
   
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (base64Audio) {
-    return `data:audio/mp3;base64,${base64Audio}`;
+    // Gemini TTS returns raw 16-bit PCM (24 kHz mono); playAudio wraps it in a WAV header.
+    return base64Audio;
   }
   throw new Error("No speech generated");
 }
@@ -165,7 +201,7 @@ export async function chatWithGemini(message: string, history: any[], language: 
 export async function processImportedStory(text: string, language: string): Promise<Story> {
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `Process this text into a 5-page kids story in ${language}: ${text}. Return as JSON with 'title' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations').`,
+    contents: `Process this text into a 5-page kids story in ${language}: ${text}. Return as JSON with 'title' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations'). 'annotations' lists 1-3 harder words from the page, each with 'word' (exactly as it appears in the text) and a short child-friendly 'explanation'.`,
     config: { 
       responseMimeType: "application/json",
       responseSchema: {
@@ -181,7 +217,17 @@ export async function processImportedStory(text: string, language: string): Prom
                 imagePrompt: { type: Type.STRING },
                 translation: { type: Type.STRING },
                 questions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                annotations: { type: Type.ARRAY, items: { type: Type.STRING } }
+                annotations: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      word: { type: Type.STRING },
+                      explanation: { type: Type.STRING }
+                    },
+                    required: ["word", "explanation"]
+                  }
+                }
               },
               required: ["text", "imagePrompt", "translation", "questions", "annotations"]
             }
@@ -200,7 +246,7 @@ export async function processImportedStory(text: string, language: string): Prom
   };
 }
 
-export async function getWordDetails(word: string, language: string): Promise<any> {
+export async function getWordDetails(word: string, language: string): Promise<WordDetails> {
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
     contents: `Provide details for the word "${word}" in ${language}. Include 'definition', 'example', and 'pronunciation'. Return as JSON.`,
@@ -217,7 +263,12 @@ export async function getWordDetails(word: string, language: string): Promise<an
       }
     }
   });
-  return JSON.parse(response.text || "{}");
+  const data = JSON.parse(response.text || "{}");
+  return {
+    explanation: data.definition || "",
+    exampleSentence: data.example || "",
+    pronunciation: data.pronunciation
+  };
 }
 
 export async function generateStoryOptions(category: string, level: string, language: string): Promise<StoryOption[]> {
