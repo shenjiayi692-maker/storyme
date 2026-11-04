@@ -15,6 +15,18 @@ export default defineConfig(({ mode }) => {
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY ?? ''),
     },
+    build: {
+      rollupOptions: {
+        output: {
+          // Split big libraries into their own long-cached chunks.
+          manualChunks: {
+            firebase: ['firebase/app', 'firebase/auth', 'firebase/firestore', 'firebase/storage'],
+            genai: ['@google/genai'],
+            motion: ['motion/react'],
+          },
+        },
+      },
+    },
     server: {
       port: 3000,
       host: '0.0.0.0',

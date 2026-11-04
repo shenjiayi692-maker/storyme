@@ -11,7 +11,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@google/genai": "latest",
+    "@google/genai": "^1.47.0",
     "clsx": "^2.1.1",
     "firebase": "^10.8.0",
     "framer-motion": "^12.38.0",

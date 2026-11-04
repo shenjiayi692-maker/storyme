@@ -60,6 +60,52 @@ export interface StoryOption {
   emoji: string;
 }
 
+export const STORY_SUBJECTS = ["adventure and magic", "animals and nature", "friendship and values", "science and discovery"];
+
+function translationInstruction(language: string): string {
+  return language.toLowerCase() === "english"
+    ? "'translation' must be an empty string."
+    : "'translation' is the page text translated into simple English.";
+}
+
+const STORY_FORMAT = (language: string) =>
+  `Return JSON with 'title', 'subject' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations'). ` +
+  `'subject' is exactly one of: ${STORY_SUBJECTS.join(", ")}. ${translationInstruction(language)} ` +
+  `'annotations' lists 1-3 harder words from the page, each with 'word' (exactly as it appears in the text) and a short child-friendly 'explanation'.`;
+
+const STORY_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    title: { type: Type.STRING },
+    subject: { type: Type.STRING, enum: STORY_SUBJECTS },
+    pages: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          text: { type: Type.STRING },
+          imagePrompt: { type: Type.STRING },
+          translation: { type: Type.STRING },
+          questions: { type: Type.ARRAY, items: { type: Type.STRING } },
+          annotations: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                word: { type: Type.STRING },
+                explanation: { type: Type.STRING }
+              },
+              required: ["word", "explanation"]
+            }
+          }
+        },
+        required: ["text", "imagePrompt", "translation", "questions", "annotations"]
+      }
+    }
+  },
+  required: ["title", "subject", "pages"]
+};
+
 export async function generateLevelWords(language: string): Promise<WordSet[]> {
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
@@ -99,43 +145,13 @@ export async function generateStory(
     Locations: ${locations.join(", ")}. ${locationDetails}
     Activities: ${activities}
     Values: ${values.join(", ")}
-    Return as JSON with 'title' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations'). 'annotations' lists 1-3 harder words from the page, each with 'word' (exactly as it appears in the text) and a short child-friendly 'explanation'.`,
+    ${STORY_FORMAT(language)}`,
     config: { 
       responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          pages: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                text: { type: Type.STRING },
-                imagePrompt: { type: Type.STRING },
-                translation: { type: Type.STRING },
-                questions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                annotations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      word: { type: Type.STRING },
-                      explanation: { type: Type.STRING }
-                    },
-                    required: ["word", "explanation"]
-                  }
-                }
-              },
-              required: ["text", "imagePrompt", "translation", "questions", "annotations"]
-            }
-          }
-        },
-        required: ["title", "pages"]
-      }
+      responseSchema: STORY_SCHEMA
     }
   });
-  const data = JSON.parse(response.text || "{}");
+  const data = parseStoryResponse(response.text);
   return {
     ...data,
     level,
@@ -144,17 +160,30 @@ export async function generateStory(
   };
 }
 
+function parseStoryResponse(text: string | undefined): Pick<Story, "title" | "pages" | "subject"> {
+  const data = JSON.parse(text || "{}");
+  if (!data.title || !Array.isArray(data.pages) || data.pages.length === 0) {
+    throw new Error("The story generator returned an empty story");
+  }
+  return data;
+}
+
 export async function generateImage(prompt: string, size: string = "1K"): Promise<string> {
-  const response = await ai.models.generateContent({
+  const request = (imageConfig: Record<string, string>) => ai.models.generateContent({
     model: "gemini-2.5-flash-image",
     contents: `Illustration for a kids story: ${prompt}`,
-    config: {
-      imageConfig: {
-        aspectRatio: "1:1",
-        imageSize: size as any
-      }
-    }
+    config: { imageConfig }
   });
+
+  let response;
+  try {
+    response = await request({ aspectRatio: "1:1", imageSize: size });
+  } catch (err) {
+    // Not every image model accepts imageSize; retry with the default resolution
+    // rather than leaving the page without an illustration.
+    console.warn("Image request with imageSize failed, retrying without it:", err);
+    response = await request({ aspectRatio: "1:1" });
+  }
   
   for (const part of response.candidates?.[0]?.content?.parts || []) {
     if (part.inlineData) {
@@ -186,11 +215,25 @@ export async function generateSpeech(text: string): Promise<string> {
   throw new Error("No speech generated");
 }
 
-export async function chatWithGemini(message: string, history: any[], language: string): Promise<string> {
+export interface ChatMessage {
+  role: 'user' | 'ai';
+  text: string;
+}
+
+export async function chatWithGemini(
+  message: string,
+  history: ChatMessage[],
+  language: string,
+  storyContext?: string
+): Promise<string> {
+  const contextNote = storyContext
+    ? `\n\nThe child is currently reading this story; answer questions about it using this text:\n${storyContext}`
+    : "";
   const chat = ai.chats.create({
     model: "gemini-3-flash-preview",
+    history: history.map(m => ({ role: m.role === 'ai' ? 'model' : 'user', parts: [{ text: m.text }] })),
     config: {
-      systemInstruction: `You are a helpful reading companion for a child learning ${language}. Keep your answers simple, encouraging, and educational.`
+      systemInstruction: `You are a helpful reading companion for a child learning ${language}. Reply in ${language}. Keep your answers simple, encouraging, educational and appropriate for young children.${contextNote}`
     }
   });
   
@@ -201,43 +244,13 @@ export async function chatWithGemini(message: string, history: any[], language: 
 export async function processImportedStory(text: string, language: string): Promise<Story> {
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `Process this text into a 5-page kids story in ${language}: ${text}. Return as JSON with 'title' and 'pages' (array of objects with 'text', 'imagePrompt', 'translation', 'questions', and 'annotations'). 'annotations' lists 1-3 harder words from the page, each with 'word' (exactly as it appears in the text) and a short child-friendly 'explanation'.`,
+    contents: `Process this text into a 5-page kids story in ${language}: ${text}. ${STORY_FORMAT(language)}`,
     config: { 
       responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          pages: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                text: { type: Type.STRING },
-                imagePrompt: { type: Type.STRING },
-                translation: { type: Type.STRING },
-                questions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                annotations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      word: { type: Type.STRING },
-                      explanation: { type: Type.STRING }
-                    },
-                    required: ["word", "explanation"]
-                  }
-                }
-              },
-              required: ["text", "imagePrompt", "translation", "questions", "annotations"]
-            }
-          }
-        },
-        required: ["title", "pages"]
-      }
+      responseSchema: STORY_SCHEMA
     }
   });
-  const data = JSON.parse(response.text || "{}");
+  const data = parseStoryResponse(response.text);
   return {
     ...data,
     level: "Intermediate",
@@ -293,6 +306,3 @@ export async function generateStoryOptions(category: string, level: string, lang
   return JSON.parse(response.text || "[]");
 }
 
-export async function generateAllStoryOptions(language: string): Promise<StoryOption[]> {
-  return generateStoryOptions("themes", "Beginner", language);
-}

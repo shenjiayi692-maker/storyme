@@ -14,7 +14,7 @@ Finding a book at exactly your child's reading level, about exactly what they li
 git clone https://github.com/shenjiayi692-maker/storyme && cd storyme && cp .env.example .env.local && npm i && npm run dev
 ```
 
-It starts and tells you which key to set; generation needs a Gemini API key.
+The app starts without a key, but story generation needs `GEMINI_API_KEY` in `.env.local`.
 
 StoryMe is an interactive reading companion for children. It estimates a reader's level, lets them choose characters, places, activities, and values, then generates a five-page story with illustrations, narration, translations, questions, and word help.
 
@@ -63,15 +63,17 @@ Gemini provides structured story text, page prompts, translations, questions, im
 | [`src/App.tsx`](./src/App.tsx) | Reading assessment, creation flow, reader, library, and persistence orchestration |
 | [`src/services/gemini.ts`](./src/services/gemini.ts) | Story, image, speech, helper, and vocabulary generation |
 | [`src/services/fileParser.ts`](./src/services/fileParser.ts) | PDF and DOCX extraction with input truncation |
-| [`src/services/authService.ts`](./src/services/authService.ts) | Email and Google sign-in plus reader profiles |
-| [`src/services/storageService.ts`](./src/services/storageService.ts) | Generated image and audio storage |
+| [`src/services/storageService.ts`](./src/services/storageService.ts) | Narration upload to Firebase Storage |
+| [`src/services/audio.ts`](./src/services/audio.ts) | Decoding stored narration (PCM/WAV/MP3) for playback |
 | [`src/translations.ts`](./src/translations.ts) | Five-language interface copy |
 
 ## Safety and product boundary
 
 StoryMe is a prototype, not a supervised literacy curriculum. Generated stories, translations, definitions, images, narration, and reading-level estimates can be wrong or inappropriate. A parent, teacher, or caregiver should review generated material before a child uses it.
 
-Firebase rules and quotas must be reviewed before a public deployment. Do not expose unrestricted generation or storage endpoints, and do not treat the current reading-level interaction as a clinical or educational assessment.
+`GEMINI_API_KEY` is compiled into the browser bundle, so anyone who opens a deployed build can read it. Outside AI Studio, put generation behind a server-side proxy (or at minimum restrict the key by HTTP referrer and set quotas) before sharing a public URL.
+
+`firestore.rules` and `storage.rules` are not applied by pushing to GitHub; deploy them with `firebase deploy --only firestore:rules,storage` (or paste them into the Firebase console). Firebase rules and quotas must be reviewed before a public deployment. Do not expose unrestricted generation or storage endpoints, and do not treat the current reading-level interaction as a clinical or educational assessment.
 
 ## License
 
